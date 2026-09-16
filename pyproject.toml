@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quad-wm"
+version = "0.1.0"
+description = "Collaborative infrastructure for quadruped world-model research"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "pytest>=9.1.1",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+sim = [
+  "mujoco>=3.0",
+]
+
+[project.scripts]
+quadwm = "quadwm.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quadwm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

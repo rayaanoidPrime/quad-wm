@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv/
+.pytest_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+wandb/
+
+# Experiment outputs: keep these outside the checkout when possible.
+runs/
+outputs/
+checkpoints/
+artifacts/
+logs/
+data/
+datasets/
+cache/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Rayaan /teach stuff
+NOTES.md
+MISSION.md
+RESOURCES.md
+assets
+docs
+learning-records
+lessons
+reference 
+
