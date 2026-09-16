@@ -14,7 +14,7 @@ from pathlib import Path
 from .config import load_config
 
 
-def _metadata(config: dict = {}) -> dict[str, str]:
+def _metadata(config: dict | None = None) -> dict[str, str]:
     return {
         "python": sys.version.split()[0],
         "host": socket.gethostname(),
@@ -25,7 +25,7 @@ def _metadata(config: dict = {}) -> dict[str, str]:
 
 
 def smoke(
-    config: dict = {},
+    config: dict | None = None,
 ) -> None:
     steps = int(config.get("steps", 20))
     output_dir = Path(config.get("run_root", "runs")) / "smoke"
