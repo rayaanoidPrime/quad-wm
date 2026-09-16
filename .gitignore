@@ -43,3 +43,6 @@ learning-records
 lessons
 reference 
 
+# slurm job artifacs 
+*.out
+*.err
