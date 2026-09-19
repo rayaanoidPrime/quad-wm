@@ -7,7 +7,7 @@ data_root: ${QUADWM_DATA_ROOT:-/path/to/external/data}
 run_root: ${QUADWM_RUN_ROOT:-runs}
 
 wandb:
-  enabled: false
+  enabled: ${QUADWM_WANDB_ENABLED:-false}
   project: quad-wm
   name: jepa-smoke
   mode: ${WANDB_MODE:-offline}
