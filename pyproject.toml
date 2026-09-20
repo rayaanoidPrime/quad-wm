@@ -9,9 +9,13 @@ description = "Collaborative infrastructure for quadruped world-model research"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "huggingface-hub>=1.32.0",
+  "imageio>=2.37.4",
   "numpy>=1.26",
   "pytest>=9.1.1",
   "pyyaml>=6.0",
+  "scipy>=1.17.1",
+  "torch>=2.14.0",
   "tqdm>=4.66",
   "wandb>=0.17",
 ]
@@ -24,6 +28,24 @@ dev = [
 sim = [
   "mujoco>=3.0",
 ]
+grandtour = [
+  "pillow>=10.0",
+  "zarr>=3.0,<4",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
+  { index = "pytorch-rocm", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.2"
 
 [project.scripts]
 quadwm = "quadwm.cli:main"
