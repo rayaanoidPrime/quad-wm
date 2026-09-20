@@ -15,7 +15,7 @@ dependencies = [
   "pytest>=9.1.1",
   "pyyaml>=6.0",
   "scipy>=1.17.1",
-  "torch>=2.14.0",
+  "torch>=2.7.1,<2.8",
   "tqdm>=4.66",
   "wandb>=0.17",
 ]
@@ -45,7 +45,7 @@ url = "https://download.pytorch.org/whl/cpu"
 
 [[tool.uv.index]]
 name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.2"
+url = "https://download.pytorch.org/whl/rocm6.2.4"
 
 [project.scripts]
 quadwm = "quadwm.cli:main"
