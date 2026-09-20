@@ -37,4 +37,8 @@ def load_config(path: Path | None) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise TypeError(f"top-level config must be a mapping: {path}")
     config["config_path"] = str(path)
+    if "data_config" in config:
+        data_path = Path(config["data_config"])
+        config["data"] = yaml.safe_load(data_path)
+        config["data"]["config_path"] = str(data_path)
     return config

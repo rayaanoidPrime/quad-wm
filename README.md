@@ -4,7 +4,7 @@ Collaborative infrastructure for quadruped world-model experiments, starting wit
 
 ## Current status
 
-This repository is at the infrastructure-scaffold stage. It contains a CPU-only smoke runner, a Slurm entry point, W&B integration hooks, collaboration rules, and the research recipes. Simulator and ANYmal-D assets are intentionally not installed yet; MuJoCo is the first simulator candidate and Isaac Lab is optional.
+This repository is at the infrastructure-and-data-contract stage. It contains a CPU-only smoke runner, a Slurm entry point, W&B integration hooks, collaboration rules, the research recipes, and a deterministic GrandTour Track 1 consumer. Simulator and ANYmal-D assets are intentionally not installed yet; MuJoCo is the first simulator candidate and Isaac Lab is optional.
 
 The first simulator gate is a headless MuJoCo physics/rendering smoke test on the target node. The code keeps simulation behind an adapter so the same training/evaluation infrastructure can later consume MuJoCo, Isaac Lab, or another simulator without rewriting the JEPA stack.
 
@@ -42,7 +42,7 @@ squeue --me
 tail -f "$RUN_ROOT/slurm/<job-id>.out"
 ```
 
-To publish metrics, authenticate once on the cluster and submit with `WANDB_MODE=online` and `WANDB_PROJECT=<project-name>`. Never put the API key in Git or a batch script.
+To publish metrics, authenticate once on the cluster, then submit with `QUADWM_WANDB_ENABLED=true` and `WANDB_MODE=online`. The config supplies the project/name; never put the API key in Git or a batch script.
 
 ## Research storage boundary
 
@@ -55,3 +55,32 @@ $SCRATCH/quad-wm/checkpoints
 ```
 
 The exact `$SCRATCH` path is cluster-specific and must be confirmed on the machine.
+
+## GrandTour Track 1 data path
+
+Install the optional reader dependencies on the cluster environment:
+
+```bash
+uv sync --extra grandtour
+```
+
+GrandTour is downloaded as gated topic archives and materialized outside the
+repository. Authenticate with the Hugging Face CLI first, then download one
+mission:
+
+```bash
+export GRANDTOUR_ROOT="$SCRATCH/quad-wm/data/grandtour"
+bash scripts/hf/download_grandtour_mission.sh 2024-11-02-17-18-32 "$GRANDTOUR_ROOT"
+uv run quadwm grandtour inspect --root "$GRANDTOUR_ROOT" \
+  --mission 2024-11-02-17-18-32
+uv run quadwm grandtour consume --root "$GRANDTOUR_ROOT" \
+  --mission 2024-11-02-17-18-32
+```
+
+The consumer anchors on depth timestamps and produces lazy samples with
+33-dimensional proprioception, the shared 40-dimensional physical state, and
+12 commanded joint-position actions. The versioned config requests a 10-frame
+proprioceptive history for the Track 1 encoder. It drops samples outside the
+configured 50 ms synchronization window. The adapter is NumPy-only so it can
+be used by future PyTorch dataloaders, Slurm jobs, and cloud notebooks without
+changing the data contract.

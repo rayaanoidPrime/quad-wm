@@ -47,12 +47,5 @@ reference
 *.out
 *.err
 
-# Source and architecture records have names that overlap the experiment-data
-# ignore patterns above, but must remain reviewable in Git.
-!src/quadwm/data/
-!src/quadwm/data/**
 src/quadwm/data/__pycache__/
-!docs/
-docs/*
-!docs/adr/
-!docs/adr/**
+

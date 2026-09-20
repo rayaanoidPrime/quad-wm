@@ -5,6 +5,7 @@ steps: 20
 # External roots are intentionally supplied by the shell environment or Slurm.
 data_root: ${QUADWM_DATA_ROOT:-/path/to/external/data}
 run_root: ${QUADWM_RUN_ROOT:-runs}
+data_config: configs/data/grandtour_smoke.yaml
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-false}
