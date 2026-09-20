@@ -5,7 +5,7 @@ from .grandtour import (
   GrandTourPairDataset,
   build_dataset,
   fetch_missions,
-  verify_joint_order_consistency
+  verify_joint_order_consistency,
 )
 
 __all__ = [

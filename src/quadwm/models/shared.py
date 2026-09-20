@@ -1,9 +1,8 @@
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
-from .jepawm import JEPAWorldModel
 # from quadwm.models import LatentWorldModel, GenerativeWorldModel TODO
-from .checkpt_utils import load_checkpoint_state_dict, load_pretrained_patch_embed, fetch_checkpoint
+from .checkpt_utils import fetch_checkpoint, load_checkpoint_state_dict, load_pretrained_patch_embed
+from .jepawm import JEPAWorldModel
 
 
 # TODO build model based on the world model type from the config.

@@ -13,9 +13,9 @@ from pathlib import Path
 
 import torch
 
-from quadwm.utils import init_wandb
 from quadwm.data import build_dataset, fetch_missions, verify_joint_order_consistency
 from quadwm.models import build_model
+from quadwm.utils import init_wandb
 
 from .config import load_config
 

@@ -1,9 +1,8 @@
 
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
 import torch
-
+from huggingface_hub import snapshot_download
 
 CHECKPOINT_REGISTRY = {
     "vjepa2-vitl": "facebook/vjepa2-vitl-fpc64-256",
