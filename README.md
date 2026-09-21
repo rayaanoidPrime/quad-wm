@@ -56,6 +56,30 @@ $SCRATCH/quad-wm/checkpoints
 
 The exact `$SCRATCH` path is cluster-specific and must be confirmed on the machine.
 
+## Train the baseline JEPA world model
+
+The baseline uses RGB, a 5 Hz world-model tick, 10 stacked 50 Hz joint-position
+commands, a 7-tick context, and a 6-step rollout. The training command caches
+frozen V-JEPA 2.1 tokens locally when the disk estimate fits; otherwise it
+streams encoder features without writing a cache.
+
+```bash
+uv sync --extra grandtour
+sbatch scripts/slurm/track1_baseline.sbatch
+```
+
+Override the allocation or paths without editing the script:
+
+```bash
+sbatch --gres=gpu:3 \
+  --export=ALL,PROJECT_DIR="$PWD",CONFIG=configs/jepa-wm/baseline.yaml \
+  scripts/slurm/track1_baseline.sbatch
+```
+
+The encoder checkpoint and feature cache live under the configured external
+roots. `quadwm prepare --config configs/jepa-wm/baseline.yaml` can be run
+interactively first; it is idempotent.
+
 ## GrandTour Track 1 data path
 
 Install the optional reader dependencies on the cluster environment:

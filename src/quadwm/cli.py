@@ -14,7 +14,8 @@ from pathlib import Path
 import torch
 
 from quadwm.data import build_dataset, fetch_missions, verify_joint_order_consistency
-from quadwm.models import build_model
+from quadwm.models import build_model, ensure_vjepa21_checkpoint
+from quadwm.training import train as train_world_model
 from quadwm.utils import init_wandb
 
 from .config import load_config
@@ -28,6 +29,10 @@ def _metadata(config: dict | None = None) -> dict[str, str]:
         "platform": platform.platform(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID", "local"),
         "config_path": config.get("config_path", "unknown"),
+        "git_commit": os.environ.get("QUADWM_GIT_COMMIT", "unknown"),
+        "visible_devices": os.environ.get(
+            "ROCR_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+        ),
     }
 
 # should this just be a test? TODO
@@ -50,6 +55,28 @@ def smoke(config: dict | None = None) -> None:
     steps = int(config.get("steps", 20))
     output_dir = Path(config.get("run_root", "runs")) / "smoke"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Keep the infrastructure smoke independent of GrandTour and GPUs.
+    if "data" not in config or "wm" not in config:
+        metrics_path = output_dir / "metrics.jsonl"
+        run_metadata = _metadata(config)
+        wandb_run = init_wandb(config, metadata=run_metadata, run_dir=output_dir)
+        if wandb_run is not None:
+            run_metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
+            run_metadata["wandb_url"] = getattr(wandb_run, "url", None)
+        (output_dir / "run_metadata.json").write_text(
+            json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        with metrics_path.open("w", encoding="utf-8") as stream:
+            for step in range(1, steps + 1):
+                metric = {"step": step, "loss": 1.0 / step, "timestamp": time.time()}
+                stream.write(json.dumps(metric) + "\n")
+                if wandb_run is not None:
+                    wandb_run.log(metric)
+        if wandb_run is not None:
+            wandb_run.finish()
+        print(f"wrote {steps} metrics to {metrics_path}")
+        return
 
     data_cfg = config["data"]
     wm_cfg = config["wm"]
@@ -124,12 +151,28 @@ def smoke(config: dict | None = None) -> None:
     print(f"wrote {steps} steps to {metrics_path}")
 
 
+def prepare(config: dict) -> None:
+    checkpoint = ensure_vjepa21_checkpoint(config.get("checkpoint_root", "checkpoints"))
+    data_cfg = config.get("data", {})
+    if data_cfg.get("download", False) and data_cfg.get("missions"):
+        fetch_missions(data_cfg["missions"], config["data_root"])
+    print(f"checkpoint ready: {checkpoint}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="quadwm")
     subparsers = parser.add_subparsers(dest="command", required=True)
     smoke_parser = subparsers.add_parser("smoke", help="run the infrastructure smoke tests")
     smoke_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/smoke.yaml"))
+    train_parser = subparsers.add_parser("train", help="train the Track 1 JEPA world model")
+    train_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/baseline.yaml"))
+    prepare_parser = subparsers.add_parser("prepare", help="download the local encoder checkpoint and data")
+    prepare_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/baseline.yaml"))
     args = parser.parse_args()
     if args.command == "smoke":
         config = load_config(args.config)
         smoke(config)
+    elif args.command == "train":
+        train_world_model(load_config(args.config))
+    elif args.command == "prepare":
+        prepare(load_config(args.config))

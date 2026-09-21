@@ -63,6 +63,13 @@ OBSERVATION_TOPICS = {
             "actuator": "anymal_state_actuator",
         },
     },
+    "rgb_plus_proprioception": {
+        "anymal_d": {
+            "depth": "alphasense_front_center",
+            "proprio": "anymal_state_state_estimator",
+            "actuator": "anymal_state_actuator",
+        },
+    },
     # "lidar_plus_proprioception": stretch goal, not wired up yet.
 }
 
@@ -79,10 +86,9 @@ def resolve_topics(observation: str, platform: str) -> dict[str, str]:
         ) from exc
 
 
-def project_gravity(quat_wxyz: np.ndarray) -> np.ndarray:
+def project_gravity(quat_xyzw: np.ndarray) -> np.ndarray:
     """Rotate the world gravity direction into the base frame."""
-    w, x, y, z = quat_wxyz
-    rot = Rotation.from_quat([x, y, z, w])  # scipy wants (x, y, z, w)
+    rot = Rotation.from_quat(quat_xyzw)  # GrandTour stores (x, y, z, w)
     return rot.inv().apply(_GRAVITY_WORLD)
 
 
@@ -173,6 +179,14 @@ class MissionReader:
         depth_mm = imageio.imread(path).astype(np.float32)
         return depth_mm / 1000.0  # mm -> m
 
+    def load_image(self, image_id: int) -> np.ndarray:
+        """Load the image at the Zarr array position, not its runtime id."""
+        for suffix in (".jpeg", ".jpg", ".png"):
+            path = self._image_dir / f"{image_id:06d}{suffix}"
+            if path.exists():
+                return imageio.imread(path)
+        raise FileNotFoundError(f"no image for {self.depth_topic}[{image_id}] in {self._image_dir}")
+
     @staticmethod
     def _nearest(timestamps: np.ndarray, t: float) -> tuple[int, float]:
         idx = bisect.bisect_left(timestamps, t)
@@ -181,19 +195,16 @@ class MissionReader:
 
     def sample_state(self, t: float) -> dict | None:
         p_idx, p_gap = self._nearest(self.proprio_timestamps, t)
-        a_idx, a_gap = self._nearest(self.actuator_timestamps, t)
-        if p_gap > self.max_gap_s or a_gap > self.max_gap_s:
+        if p_gap > self.max_gap_s:
             return None  # likely a dropped message, not a valid interpolation window
+        action = self.sample_action(t)
+        if action is None:
+            return None
 
         g = self.proprio_group
-        quat = np.asarray(g["pose_orien"][p_idx], dtype=np.float32)  # (w, x, y, z)
+        quat = np.asarray(g["pose_orien"][p_idx], dtype=np.float32)  # (x, y, z, w)
         contacts = np.array(
             [g[f"{foot}_FOOT_contact"][p_idx] for foot in FEET], dtype=np.float32
-        )
-        # "Action" = commanded joint position, per JOINT_ORDER, from the actuator topic.
-        action = np.array(
-            [self.actuator_group[f"{j:02d}_command_position"][a_idx] for j in range(len(JOINT_ORDER))],
-            dtype=np.float32,
         )
         return {
             "pose_pos": np.asarray(g["pose_pos"][p_idx], dtype=np.float32),
@@ -205,6 +216,29 @@ class MissionReader:
             "contacts": contacts,
             "action": action,
         }
+
+    def sample_action(self, t: float) -> np.ndarray | None:
+        a_idx, a_gap = self._nearest(self.actuator_timestamps, t)
+        if a_gap > self.max_gap_s:
+            return None
+        return np.array(
+            [
+                self.actuator_group[f"{j:02d}_command_position"][a_idx]
+                for j in range(len(JOINT_ORDER))
+            ],
+            dtype=np.float32,
+        )
+
+    def sample_action_window(
+        self, start_time: float, *, frames: int, control_hz: float
+    ) -> np.ndarray | None:
+        actions = [
+            self.sample_action(start_time + frame / control_hz)
+            for frame in range(frames)
+        ]
+        if any(action is None for action in actions):
+            return None
+        return np.stack(actions)
 
     def __getitem__(self, image_id: int) -> dict | None:
         t = float(self.depth_timestamps[image_id])
@@ -331,6 +365,139 @@ class GrandTourPairDataset(Dataset):
         return DataLoader(self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
 
+class GrandTourSequenceDataset(Dataset):
+    """Fixed-length RGB/proprio/action windows for JEPA-WM training."""
+
+    def __init__(
+        self,
+        readers: list[MissionReader],
+        *,
+        context_steps: int,
+        rollout_steps: int,
+        tick_hz: float,
+        control_hz: float,
+        action_frames: int,
+        max_tick_error_s: float = 0.06,
+        load_images: bool = True,
+    ):
+        self.readers = readers
+        self.context_steps = context_steps
+        self.rollout_steps = rollout_steps
+        self.total_steps = context_steps + rollout_steps
+        self.tick_dt = 1.0 / tick_hz
+        self.control_hz = control_hz
+        self.action_frames = action_frames
+        self.load_images = load_images
+        self.index: list[tuple[int, tuple[int, ...]]] = []
+        dropped = 0
+        for reader_index, reader in enumerate(readers):
+            source_dt = (
+                float(np.median(np.diff(reader.depth_timestamps)))
+                if len(reader) > 1
+                else self.tick_dt
+            )
+            start_stride = max(1, round(self.tick_dt / source_dt))
+            for start_id in range(0, len(reader.depth_timestamps), start_stride):
+                start_time = reader.depth_timestamps[start_id]
+                ids = []
+                valid = True
+                for step in range(self.total_steps):
+                    image_id, error = reader._nearest(
+                        reader.depth_timestamps, float(start_time) + step * self.tick_dt
+                    )
+                    if error > max_tick_error_s:
+                        valid = False
+                        break
+                    ids.append(image_id)
+                if not valid or len(set(ids)) != len(ids):
+                    dropped += 1
+                    continue
+                for image_id in ids:
+                    if reader.sample_state(float(reader.depth_timestamps[image_id])) is None:
+                        valid = False
+                        break
+                if valid:
+                    for image_id in ids[:-1]:
+                        if reader.sample_action_window(
+                            float(reader.depth_timestamps[image_id]),
+                            frames=action_frames,
+                            control_hz=control_hz,
+                        ) is None:
+                            valid = False
+                            break
+                if valid:
+                    self.index.append((reader_index, tuple(ids)))
+                else:
+                    dropped += 1
+        total = dropped + len(self.index)
+        self.stats = {
+            "total": total,
+            "kept": len(self.index),
+            "dropped": dropped,
+            "drop_rate": dropped / total if total else 0.0,
+        }
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, index: int) -> dict:
+        reader_index, image_ids = self.index[index]
+        reader = self.readers[reader_index]
+        states = [reader.sample_state(float(reader.depth_timestamps[i])) for i in image_ids]
+        assert all(state is not None for state in states)
+        proprio = np.stack(
+            [
+                np.concatenate(
+                    (
+                        state["lin_vel"],
+                        state["ang_vel"],
+                        state["gravity"],
+                        state["joint_pos"],
+                        state["joint_vel"],
+                    )
+                )
+                for state in states
+            ]
+        )
+        actions = np.stack(
+            [
+                reader.sample_action_window(
+                    float(reader.depth_timestamps[i]),
+                    frames=self.action_frames,
+                    control_hz=self.control_hz,
+                ).reshape(-1)
+                for i in image_ids[:-1]
+            ]
+        )
+        output = {
+            "proprio": torch.from_numpy(proprio).float(),
+            "actions": torch.from_numpy(actions).float(),
+            "mission_idx": reader_index,
+            "image_ids": torch.tensor(image_ids, dtype=torch.long),
+        }
+        if self.load_images:
+            observations = np.stack([reader.load_image(i) for i in image_ids])
+            output["images"] = torch.from_numpy(observations).permute(0, 3, 1, 2).float()
+        return output
+
+    def loader(
+        self,
+        batch_size: int,
+        shuffle: bool = True,
+        num_workers: int = 0,
+        sampler=None,
+    ) -> DataLoader:
+        return DataLoader(
+            self,
+            batch_size=batch_size,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+
 def build_dataset(
     data_config: dict,
     observation: str,
@@ -362,6 +529,50 @@ def build_dataset(
         for mission in missions
     ]
     return GrandTourPairDataset(readers, horizon=horizon, rate_hz=rate_hz)
+
+
+def build_sequence_dataset(
+    data_config: dict,
+    observation: str,
+    platform: str,
+    data_root: str | Path,
+    *,
+    context_steps: int,
+    rollout_steps: int,
+    tick_hz: float,
+    control_hz: float,
+    action_frames: int,
+    load_images: bool = True,
+) -> GrandTourSequenceDataset:
+    topics = resolve_topics(observation, platform)
+    missions = data_config.get("missions")
+    if not missions:
+        missions = sorted(
+            path.name
+            for path in Path(data_root).iterdir()
+            if path.is_dir() and (path / "data").is_dir()
+        )
+    if not missions:
+        raise ValueError("no GrandTour missions found in data_root")
+    readers = [
+        MissionReader(
+            Path(data_root) / mission,
+            depth_topic=topics["depth"],
+            proprio_topic=topics["proprio"],
+            actuator_topic=topics["actuator"],
+            max_gap_s=data_config.get("max_gap_ms", 50) / 1000.0,
+        )
+        for mission in missions
+    ]
+    return GrandTourSequenceDataset(
+        readers,
+        context_steps=context_steps,
+        rollout_steps=rollout_steps,
+        tick_hz=tick_hz,
+        control_hz=control_hz,
+        action_frames=action_frames,
+        load_images=load_images,
+    )
 
 
 def verify_joint_order_consistency(mission_root, n_samples: int = 5, atol: float = 1e-3) -> bool:

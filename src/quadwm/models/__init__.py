@@ -1,13 +1,18 @@
 """Track-specific model components + utils for checkpointing"""
 
-from .checkpt_utils import fetch_checkpoint, load_checkpoint_state_dict, load_pretrained_patch_embed
-from .jepawm import JepaWM
-from .shared import build_model
+from .jepawm import JEPAWorldModel, VJEPA21Encoder
+from .shared import (
+    build_model,
+    ensure_vjepa21_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 __all__ = [
-    "JepaWM",
+    "JEPAWorldModel",
+    "VJEPA21Encoder",
     "build_model",
-    "fetch_checkpoint",
-    "load_checkpoint_state_dict",
-    "load_pretrained_patch_embed"
+    "ensure_vjepa21_checkpoint",
+    "load_checkpoint",
+    "save_checkpoint",
 ]

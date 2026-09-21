@@ -1,0 +1,53 @@
+name: track1-baseline-jepa
+seed: 4551
+
+data_root: ${GRANDTOUR_ROOT:-/scratch/quad-wm/data/grandtour}
+run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
+checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
+
+data:
+  # Empty means: train on every already-materialized mission under data_root.
+  missions: []
+  download: false
+  observation: rgb_plus_proprioception
+  platform: anymal_d
+  tick_hz: 5
+  control_hz: 50
+  action_frames: 10
+  max_gap_ms: 50
+
+cache:
+  mode: auto
+  root: ${QUADWM_CACHE_ROOT:-/scratch/quad-wm/cache/vjepa21}
+  batch_size: 16
+
+model:
+  baseline: true
+  image_size: 384
+  visual_dim: 768
+  tokens_per_frame: 576
+  proprio_dim: 33
+  proprio_embed_dim: 16
+  action_dim: 120
+  context_steps: 7
+  rollout_steps: 6
+  rollout_context: 3
+  predictor_depth: 12
+  predictor_heads: 16
+
+training:
+  epochs: 10
+  per_gpu_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 0
+  precision: bf16
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  clip_grad_norm: 1.0
+  resume: ""
+
+wandb:
+  enabled: ${QUADWM_WANDB_ENABLED:-true}
+  project: quad-wm
+  name: track1-baseline-jepa
+  mode: ${WANDB_MODE:-online}
