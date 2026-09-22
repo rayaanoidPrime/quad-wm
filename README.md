@@ -27,8 +27,8 @@ The first simulator gate is a headless MuJoCo physics/rendering smoke test on th
 The smoke test has no PyTorch or simulator dependency. It validates run directories, resolved metadata, deterministic synthetic loss generation, and optional W&B logging.
 
 ```bash
-python -m quadwm smoke --steps 20 --output-dir runs/local-smoke
-python -m pytest -q
+uv run quadwm smoke --config configs/jepa-wm/smoke.yaml
+uv run pytest -q
 ```
 
 For Slurm, edit the project and virtual-environment paths in `scripts/slurm/track1_smoke.sbatch` or export them before submission:
@@ -77,7 +77,7 @@ sbatch --gres=gpu:3 \
 ```
 
 The encoder checkpoint and feature cache live under the configured external
-roots. `quadwm prepare --config configs/jepa-wm/baseline.yaml` can be run
+roots. `uv run quadwm prepare --config configs/jepa-wm/baseline.yaml` can be run
 interactively first; it is idempotent.
 
 ## GrandTour Track 1 data path

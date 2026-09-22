@@ -33,4 +33,4 @@ echo "config=$CONFIG storage_root=$STORAGE_ROOT run_root=$RUN_ROOT"
 
 GPUS="${SLURM_GPUS_ON_NODE:-1}"
 uv run quadwm prepare --config "$CONFIG"
-torchrun --standalone --nproc_per_node="$GPUS" -m quadwm train --config "$CONFIG"
+uv run torchrun --standalone --nproc_per_node="$GPUS" -m quadwm train --config "$CONFIG"
