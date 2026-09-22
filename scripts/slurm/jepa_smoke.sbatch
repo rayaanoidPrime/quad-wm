@@ -16,7 +16,6 @@ PROJECT_PARENT="$(dirname "$PROJECT_DIR")"
 STORAGE_ROOT="${QUADWM_STORAGE_ROOT:-$PROJECT_PARENT/quad-wm-storage}"
 RUN_ROOT="${RUN_ROOT:-${QUADWM_RUN_ROOT:-$STORAGE_ROOT/runs/smoke-$SLURM_JOB_ID}}"
 CONFIG="${CONFIG:-configs/jepa-wm/baseline_smoke.yaml}"
-DEFAULT_GRANDTOUR_ROOT="$PROJECT_PARENT/grand_tour_dataset"
 
 module purge
 module load python/3.11
@@ -24,12 +23,7 @@ module load rocm/6.2.4
 
 cd "$PROJECT_DIR"
 
-if [[ -z "${GRANDTOUR_ROOT:-}" && -d "$DEFAULT_GRANDTOUR_ROOT" ]]; then
-    GRANDTOUR_ROOT="$DEFAULT_GRANDTOUR_ROOT"
-else
-    GRANDTOUR_ROOT="${GRANDTOUR_ROOT:-$STORAGE_ROOT/data/grandtour}"
-fi
-export GRANDTOUR_ROOT
+export GRANDTOUR_ROOT="${GRANDTOUR_ROOT:-$STORAGE_ROOT/data/grandtour}"
 export QUADWM_RUN_ROOT="$RUN_ROOT"
 export QUADWM_CHECKPOINT_ROOT="${QUADWM_CHECKPOINT_ROOT:-$STORAGE_ROOT/checkpoints}"
 export QUADWM_CACHE_ROOT="${QUADWM_CACHE_ROOT:-$STORAGE_ROOT/cache/vjepa21-smoke}"

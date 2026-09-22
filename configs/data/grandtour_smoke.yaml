@@ -1,4 +1,4 @@
-data_root: ${GRANDTOUR_ROOT:-/path/to/grand_tour_dataset}
+data_root: ${GRANDTOUR_ROOT}
 missions: ["2024-11-02-17-18-32"]
 download: true
 download_topics:

@@ -1,4 +1,4 @@
-data_root: ${GRANDTOUR_ROOT:-/path/to/grand_tour_dataset}
+data_root: ${GRANDTOUR_ROOT}
 
 # No missions key means: enumerate, download, and train on every mission.
 download: true
