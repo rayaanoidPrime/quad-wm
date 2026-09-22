@@ -11,6 +11,85 @@ from quadwm.data.grandtour import (
 )
 
 
+def test_nearest_picks_closer_frame_not_next():
+    from quadwm.data.grandtour import MissionReader, _nearest_indices
+
+    # Depth frames drift slightly below 0.1s, so a 0.2s tick lands just past
+    # frame 2; bisect_left alone would return frame 3 with a ~0.1s error.
+    timestamps = np.array([0.0, 0.099999, 0.199998, 0.299997])
+    index, gap = MissionReader._nearest(timestamps, 0.2)
+    assert index == 2
+    assert gap < 1e-3
+
+    times = np.array([0.0, 0.05, 0.2, 0.299997, 10.0])
+    vector_index, vector_gap = _nearest_indices(timestamps, times)
+    for position, t in enumerate(times):
+        scalar_index, scalar_gap = MissionReader._nearest(timestamps, float(t))
+        assert vector_index[position] == scalar_index
+        assert abs(vector_gap[position] - scalar_gap) < 1e-9
+
+
+def test_clear_download_cache_passes_commit_hashes(tmp_path, monkeypatch):
+    from quadwm.data import grandtour
+
+    class _Revision:
+        def __init__(self, commit_hash):
+            self.commit_hash = commit_hash
+
+    class _Repo:
+        repo_id = grandtour.GRANDTOUR_REPO_ID
+        repo_type = "dataset"
+        revisions = {_Revision("abc"), _Revision("def")}
+
+    class _Cache:
+        repos = [_Repo()]
+        deleted = None
+
+        def delete_revisions(self, *hashes):
+            self.deleted = hashes
+            return self
+
+        def execute(self):
+            pass
+
+    cache = _Cache()
+    monkeypatch.setattr(grandtour, "scan_cache_dir", lambda: cache)
+
+    grandtour._clear_download_cache()
+
+    # delete_revisions needs the hash strings, not CachedRevisionInfo objects.
+    assert set(cache.deleted) == {"abc", "def"}
+
+
+def test_fetch_missions_clears_cache_only_after_complete_extraction(tmp_path, monkeypatch):
+    from quadwm.data import grandtour
+
+    calls = []
+    monkeypatch.setattr(grandtour, "_clear_download_cache", lambda: calls.append(True))
+    monkeypatch.setattr(grandtour, "snapshot_download", lambda **kwargs: str(tmp_path))
+    monkeypatch.setattr(grandtour, "_extract_tars", lambda *args, **kwargs: None)
+
+    # _mission_ready: first call says "pending", second says "materialized".
+    ready = iter([False, True])
+    monkeypatch.setattr(grandtour, "_mission_ready", lambda *args, **kwargs: next(ready, True))
+    grandtour.fetch_missions(["mission-a"], tmp_path)
+    assert calls == [True]
+
+    # Already materialized (nothing pending): stale archives still get cleared.
+    calls.clear()
+    monkeypatch.setattr(grandtour, "_mission_ready", lambda *args, **kwargs: True)
+    grandtour.fetch_missions(["mission-a"], tmp_path)
+    assert calls == [True]
+
+    # If extraction is still incomplete, keep the archives for resuming.
+    calls.clear()
+    ready = iter([False, False])
+    monkeypatch.setattr(grandtour, "_mission_ready", lambda *args, **kwargs: next(ready, False))
+    with pytest.raises(RuntimeError):
+        grandtour.fetch_missions(["mission-a"], tmp_path)
+    assert calls == []
+
+
 def test_remote_missions_skips_map_only_folders():
     from quadwm.data.grandtour import _remote_missions
 

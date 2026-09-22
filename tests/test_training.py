@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from quadwm.training import _build_token_cache
@@ -45,3 +46,16 @@ def test_token_cache_feeds_chw_images_to_encoder(tmp_path):
 
     metadata = (tmp_path / "mission-a.json").read_text(encoding="utf-8")
     assert '"shape": [3, 4, 8]' in metadata
+
+
+def test_token_cache_removes_partial_files_on_failure(tmp_path):
+    class _FailingEncoder(torch.nn.Module):
+        def forward(self, images: torch.Tensor) -> torch.Tensor:
+            raise RuntimeError("encoder blew up")
+
+    with pytest.raises(RuntimeError, match="encoder blew up"):
+        _build_token_cache(
+            _Dataset(), _FailingEncoder(), tmp_path, torch.device("cpu"), batch_size=2, image_size=64
+        )
+
+    assert list(tmp_path.glob("*.part")) == []

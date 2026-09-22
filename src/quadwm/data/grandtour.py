@@ -40,7 +40,7 @@ import imageio.v2 as imageio  # v2 API avoids the v3-migration deprecation warni
 import numpy as np
 import torch
 import zarr
-from huggingface_hub import list_repo_files, snapshot_download
+from huggingface_hub import list_repo_files, scan_cache_dir, snapshot_download
 from scipy.spatial.transform import Rotation
 from torch.utils.data import DataLoader, Dataset
 
@@ -241,6 +241,17 @@ def _open_mission_data(mission: Path):
     return zarr.open_group(store=data_dir, mode="r")
 
 
+def _nearest_indices(
+    timestamps: np.ndarray, times: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest index + absolute gap for many query times (vectorized)."""
+    after = np.clip(np.searchsorted(timestamps, times, side="left"), 0, len(timestamps) - 1)
+    before = np.clip(after - 1, 0, len(timestamps) - 1)
+    choose_before = np.abs(timestamps[before] - times) <= np.abs(timestamps[after] - times)
+    index = np.where(choose_before, before, after)
+    return index, np.abs(timestamps[index] - times)
+
+
 def _remote_missions(
     remote_files: list[str], download_topics: list[str] | None
 ) -> list[str]:
@@ -285,6 +296,27 @@ def _mission_ready(mission: Path, topics: list[str] | None) -> bool:
     return all((mission / "images" / topic).is_dir() for topic in camera_topics)
 
 
+def _clear_download_cache() -> None:
+    """Delete the GrandTour archives from the Hugging Face cache after extraction.
+
+    ``snapshot_download`` stores the tarballs in the shared ``hub/blobs``
+    directory, referenced through the repo's snapshot.  Extracted missions live
+    under ``data_root``, so once every pending mission is materialized the
+    archives are redundant.  Use the HF cache API so deleting the revision also
+    drops the blobs it references, instead of orphaning tens of GiB.
+    """
+    try:
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if repo.repo_id == GRANDTOUR_REPO_ID and repo.repo_type == "dataset":
+                cache.delete_revisions(
+                    *(revision.commit_hash for revision in repo.revisions)
+                ).execute()
+                return
+    except Exception as exc:  # pragma: no cover - cleanup must not fail the run
+        print(f"warning: could not clear GrandTour download cache: {exc}", flush=True)
+
+
 def fetch_missions(
     missions: list[str] | str | None,
     data_root: str | Path,
@@ -305,6 +337,9 @@ def fetch_missions(
     root.mkdir(parents=True, exist_ok=True)
     pending = [m for m in selected if not _mission_ready(root / m, download_topics)]
     if not pending:
+        # Everything is already materialized, so any archive cache left over
+        # from an earlier download is stale -- drop it here too.
+        _clear_download_cache()
         return
     allow_patterns = (
         [
@@ -326,6 +361,7 @@ def fetch_missions(
             "GrandTour extraction did not produce the required layout for: "
             + ", ".join(incomplete)
         )
+    _clear_download_cache()
 
 
 def _mission_dirs(
@@ -390,6 +426,34 @@ class MissionReader:
         self.proprio_timestamps = np.asarray(self.proprio_group["timestamp"][:])
         self.actuator_timestamps = np.asarray(self.actuator_group["timestamp"][:])
 
+        # Preload the state/action arrays once.  Indexing used to read each
+        # element straight out of Zarr per candidate sequence, which is orders
+        # of magnitude slower than numpy indexing.
+        proprio = self.proprio_group
+        self.proprio = {
+            "pose_pos": np.asarray(proprio["pose_pos"][:], dtype=np.float32),
+            "twist_lin": np.asarray(proprio["twist_lin"][:], dtype=np.float32),
+            "twist_ang": np.asarray(proprio["twist_ang"][:], dtype=np.float32),
+            "pose_orien": np.asarray(proprio["pose_orien"][:], dtype=np.float32),
+            "joint_positions": np.asarray(proprio["joint_positions"][:], dtype=np.float32),
+            "joint_velocities": np.asarray(proprio["joint_velocities"][:], dtype=np.float32),
+            "contacts": np.stack(
+                [
+                    np.asarray(proprio[f"{foot}_FOOT_contact"][:], dtype=np.float32)
+                    for foot in FEET
+                ],
+                axis=1,
+            ),
+        }
+        actuator = self.actuator_group
+        self.actions = np.stack(
+            [
+                np.asarray(actuator[f"{j:02d}_command_position"][:], dtype=np.float32)
+                for j in range(len(JOINT_ORDER))
+            ],
+            axis=1,
+        )
+
         # Per-mission calibration -- intentionally read fresh, never reused
         # across MissionReader instances.
         self.depth_transform = dict(self.depth_group.attrs.get("transform", {}))
@@ -420,9 +484,12 @@ class MissionReader:
 
     @staticmethod
     def _nearest(timestamps: np.ndarray, t: float) -> tuple[int, float]:
-        idx = bisect.bisect_left(timestamps, t)
-        idx = min(max(idx, 0), len(timestamps) - 1)
-        return idx, abs(float(timestamps[idx]) - t)
+        """Index of the timestamp closest to ``t`` (ties go to the earlier one)."""
+        after = min(max(bisect.bisect_left(timestamps, t), 0), len(timestamps) - 1)
+        before = max(after - 1, 0)
+        if abs(float(timestamps[before]) - t) <= abs(float(timestamps[after]) - t):
+            return before, abs(float(timestamps[before]) - t)
+        return after, abs(float(timestamps[after]) - t)
 
     def sample_state(self, t: float) -> dict | None:
         p_idx, p_gap = self._nearest(self.proprio_timestamps, t)
@@ -432,19 +499,16 @@ class MissionReader:
         if action is None:
             return None
 
-        g = self.proprio_group
-        quat = np.asarray(g["pose_orien"][p_idx], dtype=np.float32)  # (x, y, z, w)
-        contacts = np.array(
-            [g[f"{foot}_FOOT_contact"][p_idx] for foot in FEET], dtype=np.float32
-        )
+        state = self.proprio
+        quat = state["pose_orien"][p_idx]  # (x, y, z, w)
         return {
-            "pose_pos": np.asarray(g["pose_pos"][p_idx], dtype=np.float32),
-            "lin_vel": np.asarray(g["twist_lin"][p_idx], dtype=np.float32),
-            "ang_vel": np.asarray(g["twist_ang"][p_idx], dtype=np.float32),
+            "pose_pos": state["pose_pos"][p_idx],
+            "lin_vel": state["twist_lin"][p_idx],
+            "ang_vel": state["twist_ang"][p_idx],
             "gravity": project_gravity(quat).astype(np.float32),
-            "joint_pos": np.asarray(g["joint_positions"][p_idx], dtype=np.float32),
-            "joint_vel": np.asarray(g["joint_velocities"][p_idx], dtype=np.float32),
-            "contacts": contacts,
+            "joint_pos": state["joint_positions"][p_idx],
+            "joint_vel": state["joint_velocities"][p_idx],
+            "contacts": state["contacts"][p_idx],
             "action": action,
         }
 
@@ -452,13 +516,7 @@ class MissionReader:
         a_idx, a_gap = self._nearest(self.actuator_timestamps, t)
         if a_gap > self.max_gap_s:
             return None
-        return np.array(
-            [
-                self.actuator_group[f"{j:02d}_command_position"][a_idx]
-                for j in range(len(JOINT_ORDER))
-            ],
-            dtype=np.float32,
-        )
+        return self.actions[a_idx]
 
     def sample_action_window(
         self, start_time: float, *, frames: int, control_hz: float
@@ -677,46 +735,41 @@ class GrandTourSequenceDataset(Dataset):
         self.index: list[tuple[int, tuple[int, ...]]] = []
         dropped = 0
         for reader_index, reader in enumerate(readers):
+            if len(reader) == 0:
+                continue
             source_dt = (
                 float(np.median(np.diff(reader.depth_timestamps)))
                 if len(reader) > 1
                 else self.tick_dt
             )
             start_stride = max(1, round(self.tick_dt / source_dt))
-            for start_id in range(0, len(reader.depth_timestamps), start_stride):
-                start_time = reader.depth_timestamps[start_id]
-                ids = []
-                valid = True
-                for step in range(self.total_steps):
-                    image_id, error = reader._nearest(
-                        reader.depth_timestamps, float(start_time) + step * self.tick_dt
-                    )
-                    if error > max_tick_error_s:
-                        valid = False
-                        break
-                    ids.append(image_id)
-                if not valid or len(set(ids)) != len(ids):
-                    dropped += 1
-                    continue
-                for image_id in ids:
-                    if reader.sample_state(float(reader.depth_timestamps[image_id])) is None:
-                        valid = False
-                        break
-                if valid:
-                    for image_id in ids[:-1]:
-                        if reader.sample_action_window(
-                            float(reader.depth_timestamps[image_id]),
-                            frames=action_frames,
-                            control_hz=control_hz,
-                        ) is None:
-                            valid = False
-                            break
-                if valid:
-                    self.index.append((reader_index, tuple(ids)))
-                    if max_sequences is not None and len(self.index) >= max_sequences:
-                        break
-                else:
-                    dropped += 1
+            start_ids = np.arange(0, len(reader.depth_timestamps), start_stride)
+            start_times = reader.depth_timestamps[start_ids].astype(np.float64)
+            offsets = np.arange(self.total_steps, dtype=np.float64) * self.tick_dt
+            times = start_times[:, None] + offsets[None, :]
+
+            ids, error = _nearest_indices(reader.depth_timestamps, times)
+            valid = (error <= max_tick_error_s).all(axis=1)
+            valid &= (np.diff(ids, axis=1) > 0).all(axis=1)
+
+            # sample_state validity is timestamp-only: proprio and actuator gaps.
+            id_times = reader.depth_timestamps[ids]
+            _, proprio_gap = _nearest_indices(reader.proprio_timestamps, id_times)
+            _, actuator_gap = _nearest_indices(reader.actuator_timestamps, id_times)
+            valid &= (proprio_gap <= reader.max_gap_s).all(axis=1)
+            valid &= (actuator_gap <= reader.max_gap_s).all(axis=1)
+
+            # Action windows for all but the final tick.
+            window_offsets = np.arange(self.action_frames, dtype=np.float64) / self.control_hz
+            window_times = id_times[:, :-1, None] + window_offsets[None, None, :]
+            _, window_gap = _nearest_indices(reader.actuator_timestamps, window_times)
+            valid &= (window_gap <= reader.max_gap_s).all(axis=(1, 2))
+
+            dropped += int((~valid).sum())
+            for row in ids[valid]:
+                self.index.append((reader_index, tuple(int(image_id) for image_id in row)))
+                if max_sequences is not None and len(self.index) >= max_sequences:
+                    break
             if max_sequences is not None and len(self.index) >= max_sequences:
                 break
         total = dropped + len(self.index)

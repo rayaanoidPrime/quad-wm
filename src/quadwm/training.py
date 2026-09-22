@@ -126,25 +126,44 @@ def _build_token_cache(
         shape = (len(image_ids), *first_tokens.shape[1:])
         if _cache_valid(cache_root, mission, image_ids, shape):
             continue
+        print(
+            f"stage=feature_cache mission={mission} images={len(image_ids)} "
+            f"shape={tuple(shape)}",
+            flush=True,
+        )
         temporary = cache_root / f"{mission}.mmap.part"
         metadata_temporary = cache_root / f"{mission}.json.part"
-        tokens = np.memmap(temporary, mode="w+", dtype=np.float16, shape=shape)
-        for start in range(0, len(image_ids), batch_size):
-            ids = image_ids[start : start + batch_size]
-            images = np.stack([reader.load_image(image_id) for image_id in ids])
-            images = _prepare_images(
-                torch.from_numpy(images).permute(0, 3, 1, 2).unsqueeze(1),
-                device,
-                image_size,
-            )[:, 0]
-            tokens[start : start + len(ids)] = encoder(images).float().cpu().numpy().astype(np.float16)
-        tokens.flush()
-        metadata_temporary.write_text(
-            json.dumps({"image_ids": image_ids, "shape": list(shape)}) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, cache_root / f"{mission}.mmap")
-        os.replace(metadata_temporary, cache_root / f"{mission}.json")
+        required_bytes = int(np.prod(shape)) * np.dtype(np.float16).itemsize
+        free = shutil.disk_usage(cache_root).free
+        if required_bytes > free * 0.9:
+            raise RuntimeError(
+                f"not enough disk for token cache of {mission}: "
+                f"need {required_bytes / 1024**3:.1f} GiB, free {free / 1024**3:.1f} GiB. "
+                "Set cache.mode=off or point QUADWM_CACHE_ROOT at a larger filesystem."
+            )
+        try:
+            tokens = np.memmap(temporary, mode="w+", dtype=np.float16, shape=shape)
+            for start in range(0, len(image_ids), batch_size):
+                ids = image_ids[start : start + batch_size]
+                images = np.stack([reader.load_image(image_id) for image_id in ids])
+                images = _prepare_images(
+                    torch.from_numpy(images).permute(0, 3, 1, 2).unsqueeze(1),
+                    device,
+                    image_size,
+                )[:, 0]
+                tokens[start : start + len(ids)] = encoder(images).float().cpu().numpy().astype(np.float16)
+            tokens.flush()
+            metadata_temporary.write_text(
+                json.dumps({"image_ids": image_ids, "shape": list(shape)}) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, cache_root / f"{mission}.mmap")
+            os.replace(metadata_temporary, cache_root / f"{mission}.json")
+        finally:
+            # Never leave a multi-GiB .part behind if the job dies mid-write.
+            temporary.unlink(missing_ok=True)
+            metadata_temporary.unlink(missing_ok=True)
+        print(f"stage=feature_cache mission={mission} status=done", flush=True)
 
 
 def _cache_fits(datasets, cache_root: Path, tokens: int, dim: int) -> bool:
