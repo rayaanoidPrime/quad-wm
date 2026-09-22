@@ -113,13 +113,15 @@ def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | N
         dest.parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(f, "r") as tar:
             members = tar.getmembers()
-            mission_prefix = dest.parent.name + "/"
+            relative_archive = f.relative_to(cache_dir)
+            mission_name = relative_archive.parts[0]
+            mission_prefix = mission_name + "/"
             archive_has_mission_prefix = any(
-                member.name == dest.parent.name
+                member.name == mission_name
                 or member.name.startswith(mission_prefix)
                 for member in members
             )
-            extract_root = dest.parent.parent if archive_has_mission_prefix else dest.parent
+            extract_root = dest_dir if archive_has_mission_prefix else dest.parent
             tar.extractall(path=extract_root)
 
     for f in [x for x in files if x.suffix != ".tar" and x.is_file()]:

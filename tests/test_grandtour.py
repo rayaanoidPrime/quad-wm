@@ -110,6 +110,25 @@ def test_materialize_mission_extracts_topic_archive(tmp_path):
     assert not archive.exists()
 
 
+def test_extract_tars_handles_grandtour_data_prefix(tmp_path):
+    from quadwm.data.grandtour import _extract_tars
+
+    cache = tmp_path / "cache"
+    mission_data = cache / "mission-a" / "data"
+    mission_data.mkdir(parents=True)
+    archive = mission_data / "topic.tar"
+    source = tmp_path / "source.txt"
+    source.write_text("ok", encoding="utf-8")
+    stream = tarfile.open(archive, "w")
+    stream.add(source, arcname="mission-a/data/topic.txt")
+    stream.close()
+
+    output = tmp_path / "output"
+    _extract_tars(cache, output, ["mission-a/data/topic.tar"])
+
+    assert (output / "mission-a" / "data" / "topic.txt").read_text() == "ok"
+
+
 def test_split_mission_names_is_seeded_and_mission_level():
     first = split_mission_names(["c", "a", "b", "d"], seed=12)
     second = split_mission_names(["d", "b", "a", "c"], seed=12)
