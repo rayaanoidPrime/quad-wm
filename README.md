@@ -64,7 +64,7 @@ frozen V-JEPA 2.1 tokens locally when the disk estimate fits; otherwise it
 streams encoder features without writing a cache.
 
 ```bash
-uv sync --extra grandtour
+uv sync
 sbatch scripts/slurm/track1_baseline.sbatch
 ```
 
@@ -82,10 +82,10 @@ interactively first; it is idempotent.
 
 ## GrandTour Track 1 data path
 
-Install the optional reader dependencies on the cluster environment:
+Install the project dependencies on the cluster environment:
 
 ```bash
-uv sync --extra grandtour
+uv sync
 ```
 
 GrandTour is downloaded as gated topic archives and materialized outside the

@@ -28,6 +28,7 @@ instances of this class, not built here.
 from __future__ import annotations
 
 import bisect
+import random
 import re
 import shutil
 import tarfile
@@ -133,6 +134,79 @@ def _mission_names(missions: list[str] | str | None) -> list[str]:
     if isinstance(missions, str):
         return [mission.strip() for mission in missions.split(",") if mission.strip()]
     return list(missions)
+
+
+@dataclass(frozen=True)
+class MissionReport:
+    mission: str
+    image_counts: dict[str, int]
+    has_data_group: bool
+    missing_required_topics: list[str]
+
+
+def inspect_mission(mission: str | Path) -> MissionReport:
+    mission = Path(mission)
+    image_counts = {
+        topic.name: sum(path.is_file() for path in topic.iterdir())
+        for topic in (mission / "images").iterdir()
+        if topic.is_dir()
+    } if (mission / "images").is_dir() else {}
+    present_topics = {
+        path.stem for path in (mission / "metadata").glob("*.yaml")
+    } if (mission / "metadata").is_dir() else set()
+    required_topics = {
+        "depth_camera_front_upper",
+        "anymal_state_actuator",
+        "anymal_state_odometry",
+        "anymal_state_state_estimator",
+    }
+    return MissionReport(
+        mission=mission.name,
+        image_counts=image_counts,
+        has_data_group=(mission / "data").is_dir(),
+        missing_required_topics=sorted(required_topics - present_topics),
+    )
+
+
+def inspect_root(root: str | Path, required_topics: list[str] | None = None) -> dict:
+    root = Path(root)
+    missions = []
+    for mission in sorted(path for path in root.iterdir() if path.is_dir()):
+        report = inspect_mission(mission)
+        item = {
+            "mission": report.mission,
+            "image_counts": report.image_counts,
+            "has_data_group": report.has_data_group,
+        }
+        if required_topics is not None:
+            item["missing_required_topics"] = sorted(
+                set(required_topics) & set(report.missing_required_topics)
+            )
+        missions.append(item)
+    return {"mission_count": len(missions), "missions": missions}
+
+
+def materialize_mission(mission: str | Path) -> int:
+    mission = Path(mission)
+    archives = sorted(mission.glob("*.tar"))
+    for archive in archives:
+        with tarfile.open(archive, "r") as tar:
+            members = tar.getmembers()
+            prefix = mission.name + "/"
+            has_prefix = any(
+                member.name == mission.name or member.name.startswith(prefix)
+                for member in members
+            )
+            tar.extractall(path=mission.parent if has_prefix else mission)
+        archive.unlink()
+    return len(archives)
+
+
+def split_mission_names(names: list[str], seed: int, eval_fraction: float = 0.2) -> tuple[list[str], list[str]]:
+    shuffled = sorted(names)
+    random.Random(seed).shuffle(shuffled)
+    eval_count = max(1, round(len(shuffled) * eval_fraction)) if shuffled else 0
+    return shuffled[eval_count:], shuffled[:eval_count]
 
 
 def _mission_ready(mission: Path, topics: list[str] | None) -> bool:
@@ -344,6 +418,60 @@ class MissionReader:
         if state is None:
             return None
         return {"depth": self.load_depth(image_id), "timestamp": t, **state}
+
+
+class Track1MissionDataset(Dataset):
+    """Small depth-clock adapter retained for data-contract tests and probes."""
+
+    def __init__(self, mission: str | Path):
+        self.mission_dir = Path(mission)
+        self.root = zarr.open_group(store=self.mission_dir / "data", mode="r")
+        self.depth = self.root["depth_camera_front_upper"]
+        self.state = self.root["anymal_state_state_estimator"]
+        self.actuator = self.root["anymal_state_actuator"]
+        self.depth_timestamps = np.asarray(self.depth["timestamp"][:])
+        self.state_timestamps = np.asarray(self.state["timestamp"][:])
+        self.actuator_timestamps = np.asarray(self.actuator["timestamp"][:])
+        self.dimensions = {"proprio": 33, "proprio_history": 1, "state": 40, "action": 12}
+
+    def __len__(self) -> int:
+        return len(self.depth_timestamps)
+
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+        timestamp = float(self.depth_timestamps[index])
+        state_index, _ = MissionReader._nearest(self.state_timestamps, timestamp)
+        action_index, _ = MissionReader._nearest(self.actuator_timestamps, timestamp)
+        gravity = project_gravity(np.asarray(self.state["pose_orien"][state_index]))
+        proprio = np.concatenate(
+            [
+                np.asarray(self.state["twist_lin"][state_index]),
+                np.asarray(self.state["twist_ang"][state_index]),
+                gravity,
+                np.asarray(self.state["joint_positions"][state_index]),
+                np.asarray(self.state["joint_velocities"][state_index]),
+            ]
+        ).astype(np.float32)
+        contacts = np.asarray(
+            [self.state[f"{foot}_FOOT_contact"][state_index] for foot in FEET],
+            dtype=np.float32,
+        )
+        state = np.concatenate(
+            [
+                np.asarray(self.state["pose_pos"][state_index]),
+                proprio,
+                contacts,
+            ]
+        ).astype(np.float32)
+        action = np.asarray(
+            [self.actuator[f"{joint:02d}_command_position"][action_index] for joint in range(12)],
+            dtype=np.float32,
+        )
+        return {
+            "proprio": proprio,
+            "proprio_history": proprio[None, :],
+            "state": state,
+            "action": action,
+        }
 
 
 # --------------------------------------------------------------------------
