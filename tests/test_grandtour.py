@@ -117,3 +117,43 @@ def test_split_mission_names_is_seeded_and_mission_level():
     assert first == second
     assert set(first[0]).isdisjoint(first[1])
     assert set(first[0]) | set(first[1]) == {"a", "b", "c", "d"}
+
+
+def test_sequence_builder_accepts_single_mission_root(tmp_path):
+    zarr = pytest.importorskip("zarr")
+    from quadwm.data.grandtour import build_sequence_dataset
+
+    mission = tmp_path / "mission-a"
+    root = zarr.open_group(store=mission / "data", mode="w")
+    timestamps = np.array([0.0, 0.2])
+    camera = root.create_group("alphasense_front_center")
+    camera.create_array("timestamp", data=timestamps)
+    state = root.create_group("anymal_state_state_estimator")
+    state.create_array("timestamp", data=timestamps)
+    state.create_array("pose_pos", data=np.zeros((2, 3)))
+    state.create_array("twist_lin", data=np.zeros((2, 3)))
+    state.create_array("twist_ang", data=np.zeros((2, 3)))
+    state.create_array("pose_orien", data=np.tile([0.0, 0.0, 0.0, 1.0], (2, 1)))
+    state.create_array("joint_positions", data=np.zeros((2, 12)))
+    state.create_array("joint_velocities", data=np.zeros((2, 12)))
+    for foot in ("LF", "RF", "LH", "RH"):
+        state.create_array(f"{foot}_FOOT_contact", data=np.zeros(2))
+    actuator = root.create_group("anymal_state_actuator")
+    actuator.create_array("timestamp", data=timestamps)
+    for index in range(12):
+        actuator.create_array(f"{index:02d}_command_position", data=np.zeros(2))
+
+    dataset = build_sequence_dataset(
+        {"missions": []},
+        observation="rgb_plus_proprioception",
+        platform="anymal_d",
+        data_root=mission,
+        context_steps=1,
+        rollout_steps=1,
+        tick_hz=5,
+        control_hz=50,
+        action_frames=1,
+        load_images=False,
+    )
+
+    assert dataset.readers[0].mission_dir == mission

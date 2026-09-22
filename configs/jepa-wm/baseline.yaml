@@ -7,8 +7,9 @@ checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
 
 data:
   # Empty means: train on every already-materialized mission under data_root.
-  missions: []
-  download: false
+  # Set GRANDTOUR_MISSIONS=mission-a,mission-b to download named missions.
+  missions: ${GRANDTOUR_MISSIONS:-}
+  download: true
   observation: rgb_plus_proprioception
   platform: anymal_d
   tick_hz: 5

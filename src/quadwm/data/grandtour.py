@@ -116,14 +116,23 @@ def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str]) ->
         shutil.copy2(f, dest)
 
 
-def fetch_missions(missions: list[str], data_root: str | Path) -> None:
+def _mission_names(missions: list[str] | str | None) -> list[str]:
+    if missions is None:
+        return []
+    if isinstance(missions, str):
+        return [mission.strip() for mission in missions.split(",") if mission.strip()]
+    return list(missions)
+
+
+def fetch_missions(missions: list[str] | str | None, data_root: str | Path) -> None:
     """Idempotent: skips a mission entirely if its `data/` folder already
     exists on disk. Safe to re-run after an interrupted download -- but note
     this is a coarse completeness check: a mission that was only *partially*
     extracted before an interruption (data/ exists, some topics missing) will
     NOT be re-fetched. Delete that mission's directory to force a redo.
     """
-    root = Path(data_root)
+    root = Path(data_root).expanduser()
+    missions = _mission_names(missions)
     root.mkdir(parents=True, exist_ok=True)
     pending = [m for m in missions if not (root / m / "data").exists()]
     if not pending:
@@ -506,7 +515,7 @@ def build_dataset(
     horizon: int = 4,
 ) -> GrandTourPairDataset:
     topics = resolve_topics(observation, platform)
-    missions = data_config.get("missions")
+    missions = _mission_names(data_config.get("missions"))
     if missions is None:
         # "split" (train/val/test) resolution needs a manifest mapping split
         # name -> mission list; not built yet. Fail loudly rather than guess.
@@ -517,7 +526,7 @@ def build_dataset(
 
     max_gap_s = data_config.get("max_gap_ms", 50) / 1000.0
     rate_hz = data_config.get("sync_rate_hz", 15.0)
-    root = Path(data_root)
+    root = Path(data_root).expanduser()
     readers = [
         MissionReader(
             root / mission,
@@ -545,24 +554,39 @@ def build_sequence_dataset(
     load_images: bool = True,
 ) -> GrandTourSequenceDataset:
     topics = resolve_topics(observation, platform)
-    missions = data_config.get("missions")
-    if not missions:
-        missions = sorted(
-            path.name
-            for path in Path(data_root).iterdir()
-            if path.is_dir() and (path / "data").is_dir()
+    root = Path(data_root).expanduser()
+    missions = _mission_names(data_config.get("missions"))
+    if missions:
+        mission_dirs = [root / mission for mission in missions]
+    elif (root / "data").is_dir():
+        # Also accept GRANDTOUR_ROOT pointing directly at one mission.
+        mission_dirs = [root]
+    elif root.is_dir():
+        mission_dirs = sorted(
+            path for path in root.iterdir() if path.is_dir() and (path / "data").is_dir()
         )
-    if not missions:
-        raise ValueError("no GrandTour missions found in data_root")
+    else:
+        mission_dirs = []
+    if not mission_dirs:
+        raise ValueError(
+            f"no GrandTour missions found under {root}; expected <root>/<mission>/data "
+            "or <root>/data. Set GRANDTOUR_ROOT to the materialized dataset."
+        )
+    missing = [path for path in mission_dirs if not (path / "data").is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            "configured GrandTour missions are not materialized: "
+            + ", ".join(str(path) for path in missing)
+        )
     readers = [
         MissionReader(
-            Path(data_root) / mission,
+            mission_dir,
             depth_topic=topics["depth"],
             proprio_topic=topics["proprio"],
             actuator_topic=topics["actuator"],
             max_gap_s=data_config.get("max_gap_ms", 50) / 1000.0,
         )
-        for mission in missions
+        for mission_dir in mission_dirs
     ]
     return GrandTourSequenceDataset(
         readers,
