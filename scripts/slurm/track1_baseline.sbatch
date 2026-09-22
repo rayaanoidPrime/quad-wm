@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=quadwm-jepa
-#SBATCH --output=logs/quadwm-jepa-%j.out
-#SBATCH --error=logs/quadwm-jepa-%j.err
+#SBATCH --output=logs/jepa-%j.out
+#SBATCH --error=logs/jepa-%j.err
 #SBATCH --time=23:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32

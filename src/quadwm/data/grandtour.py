@@ -111,7 +111,15 @@ def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | N
         dest = dest_dir / f.relative_to(cache_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(f, "r") as tar:
-            tar.extractall(path=dest.parent)
+            members = tar.getmembers()
+            mission_prefix = dest.parent.name + "/"
+            archive_has_mission_prefix = any(
+                member.name == dest.parent.name
+                or member.name.startswith(mission_prefix)
+                for member in members
+            )
+            extract_root = dest.parent.parent if archive_has_mission_prefix else dest.parent
+            tar.extractall(path=extract_root)
 
     for f in [x for x in files if x.suffix != ".tar" and x.is_file()]:
         dest = dest_dir / f.relative_to(cache_dir)
@@ -187,6 +195,12 @@ def fetch_missions(
         repo_id=GRANDTOUR_REPO_ID, allow_patterns=allow_patterns, repo_type="dataset"
     )
     _extract_tars(Path(cache_path), root, allow_patterns)
+    incomplete = [m for m in pending if not _mission_ready(root / m, download_topics)]
+    if incomplete:
+        raise RuntimeError(
+            "GrandTour extraction did not produce the required layout for: "
+            + ", ".join(incomplete)
+        )
 
 
 def _mission_dirs(

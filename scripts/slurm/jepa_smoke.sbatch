@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=quadwm-jepa-smoke
-#SBATCH --output=jepa-smoke-%j.out
-#SBATCH --error=jepa-smoke-%j.err
+#SBATCH --output=logs/jepa-smoke-%j.out
+#SBATCH --error=logs/jepa-smoke-%j.err
 #SBATCH --time=00:10:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
