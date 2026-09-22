@@ -38,7 +38,7 @@ import imageio.v2 as imageio  # v2 API avoids the v3-migration deprecation warni
 import numpy as np
 import torch
 import zarr
-from huggingface_hub import snapshot_download
+from huggingface_hub import list_repo_files, snapshot_download
 from scipy.spatial.transform import Rotation
 from torch.utils.data import DataLoader, Dataset
 
@@ -96,13 +96,16 @@ def project_gravity(quat_xyzw: np.ndarray) -> np.ndarray:
 # Download
 # --------------------------------------------------------------------------
 
-def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str]) -> None:
+def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | None) -> None:
     def to_regex(patterns: list[str]) -> re.Pattern:
         parts = [f".*{re.escape(p).replace(r'\*', '.*').replace(r'\?', '.')}$" for p in patterns]
         return re.compile("|".join(parts))
 
-    pattern = to_regex(allow_patterns)
-    files = [f for f in Path(cache_dir).rglob("*") if pattern.match(str(f))]
+    pattern = to_regex(allow_patterns) if allow_patterns else None
+    files = [
+        f for f in Path(cache_dir).rglob("*")
+        if f.is_file() and (pattern is None or pattern.match(str(f)))
+    ]
 
     for f in [x for x in files if x.suffix == ".tar"]:
         dest = dest_dir / f.relative_to(cache_dir)
@@ -124,24 +127,96 @@ def _mission_names(missions: list[str] | str | None) -> list[str]:
     return list(missions)
 
 
-def fetch_missions(missions: list[str] | str | None, data_root: str | Path) -> None:
-    """Idempotent: skips a mission entirely if its `data/` folder already
-    exists on disk. Safe to re-run after an interrupted download -- but note
-    this is a coarse completeness check: a mission that was only *partially*
-    extracted before an interruption (data/ exists, some topics missing) will
-    NOT be re-fetched. Delete that mission's directory to force a redo.
+def _mission_ready(mission: Path, topics: list[str] | None) -> bool:
+    if not (mission / "data").is_dir():
+        return False
+    if not topics:
+        return True
+    try:
+        root = zarr.open_group(store=mission / "data", mode="r")
+        if any(topic not in root for topic in topics):
+            return False
+    except (KeyError, OSError, ValueError):
+        return False
+    camera_topics = tuple(
+        topic for topic in topics if topic.startswith(("alpha", "hdr", "depth", "zed"))
+    )
+    return all((mission / "images" / topic).is_dir() for topic in camera_topics)
+
+
+def fetch_missions(
+    missions: list[str] | str | None,
+    data_root: str | Path,
+    download_topics: list[str] | None = None,
+) -> None:
+    """Download selected missions, or every remote mission when selection is None.
+
+    Idempotent: skips a mission when its required topics are already materialized.
+    A mission with only a partial topic download is completed on the next run.
     """
     root = Path(data_root).expanduser()
-    missions = _mission_names(missions)
+    selected = _mission_names(missions)
+    if missions is None:
+        remote_files = list_repo_files(repo_id=GRANDTOUR_REPO_ID, repo_type="dataset")
+        selected = sorted(
+            {
+                mission
+                for path in remote_files
+                if "/" in path
+                for mission in [path.split("/", 1)[0]]
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}", mission)
+            }
+        )
+    if not selected:
+        raise ValueError("GrandTour download selection contains no missions")
     root.mkdir(parents=True, exist_ok=True)
-    pending = [m for m in missions if not (root / m / "data").exists()]
+    pending = [m for m in selected if not _mission_ready(root / m, download_topics)]
     if not pending:
         return
-    allow_patterns = [f"{m}/*" for m in pending]
+    allow_patterns = (
+        [
+            f"{mission}/*{topic}*"
+            for mission in pending
+            for topic in download_topics
+        ]
+        + [f"{mission}/*.yaml" for mission in pending]
+        if download_topics
+        else [f"{mission}/*" for mission in pending]
+    )
     cache_path = snapshot_download(
         repo_id=GRANDTOUR_REPO_ID, allow_patterns=allow_patterns, repo_type="dataset"
     )
     _extract_tars(Path(cache_path), root, allow_patterns)
+
+
+def _mission_dirs(
+    data_root: str | Path,
+    missions: list[str] | str | None,
+) -> tuple[Path, list[Path]]:
+    root = Path(data_root).expanduser()
+    names = _mission_names(missions)
+    if names:
+        mission_dirs = [root / mission for mission in names]
+    elif (root / "data").is_dir():
+        mission_dirs = [root]
+    elif root.is_dir():
+        mission_dirs = sorted(
+            path for path in root.iterdir() if path.is_dir() and (path / "data").is_dir()
+        )
+    else:
+        mission_dirs = []
+    if not mission_dirs:
+        raise ValueError(
+            f"no GrandTour missions found under {root}; expected <root>/<mission>/data "
+            "or <root>/data. Set GRANDTOUR_ROOT to the materialized dataset."
+        )
+    missing = [path for path in mission_dirs if not (path / "data").is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            "configured GrandTour missions are not materialized: "
+            + ", ".join(str(path) for path in missing)
+        )
+    return root, mission_dirs
 
 
 # --------------------------------------------------------------------------
@@ -387,6 +462,7 @@ class GrandTourSequenceDataset(Dataset):
         control_hz: float,
         action_frames: int,
         max_tick_error_s: float = 0.06,
+        max_sequences: int | None = None,
         load_images: bool = True,
     ):
         self.readers = readers
@@ -436,8 +512,12 @@ class GrandTourSequenceDataset(Dataset):
                             break
                 if valid:
                     self.index.append((reader_index, tuple(ids)))
+                    if max_sequences is not None and len(self.index) >= max_sequences:
+                        break
                 else:
                     dropped += 1
+            if max_sequences is not None and len(self.index) >= max_sequences:
+                break
         total = dropped + len(self.index)
         self.stats = {
             "total": total,
@@ -515,27 +595,18 @@ def build_dataset(
     horizon: int = 4,
 ) -> GrandTourPairDataset:
     topics = resolve_topics(observation, platform)
-    missions = _mission_names(data_config.get("missions"))
-    if missions is None:
-        # "split" (train/val/test) resolution needs a manifest mapping split
-        # name -> mission list; not built yet. Fail loudly rather than guess.
-        raise NotImplementedError(
-            "data_config['split'] lookup isn't wired up yet -- "
-            "pass an explicit 'missions' list in the data config for now."
-        )
-
     max_gap_s = data_config.get("max_gap_ms", 50) / 1000.0
     rate_hz = data_config.get("sync_rate_hz", 15.0)
-    root = Path(data_root).expanduser()
+    _, mission_dirs = _mission_dirs(data_root, data_config.get("missions"))
     readers = [
         MissionReader(
-            root / mission,
+            mission_dir,
             depth_topic=topics["depth"],
             proprio_topic=topics["proprio"],
             actuator_topic=topics["actuator"],
             max_gap_s=max_gap_s,
         )
-        for mission in missions
+        for mission_dir in mission_dirs
     ]
     return GrandTourPairDataset(readers, horizon=horizon, rate_hz=rate_hz)
 
@@ -551,33 +622,11 @@ def build_sequence_dataset(
     tick_hz: float,
     control_hz: float,
     action_frames: int,
+    max_sequences: int | None = None,
     load_images: bool = True,
 ) -> GrandTourSequenceDataset:
     topics = resolve_topics(observation, platform)
-    root = Path(data_root).expanduser()
-    missions = _mission_names(data_config.get("missions"))
-    if missions:
-        mission_dirs = [root / mission for mission in missions]
-    elif (root / "data").is_dir():
-        # Also accept GRANDTOUR_ROOT pointing directly at one mission.
-        mission_dirs = [root]
-    elif root.is_dir():
-        mission_dirs = sorted(
-            path for path in root.iterdir() if path.is_dir() and (path / "data").is_dir()
-        )
-    else:
-        mission_dirs = []
-    if not mission_dirs:
-        raise ValueError(
-            f"no GrandTour missions found under {root}; expected <root>/<mission>/data "
-            "or <root>/data. Set GRANDTOUR_ROOT to the materialized dataset."
-        )
-    missing = [path for path in mission_dirs if not (path / "data").is_dir()]
-    if missing:
-        raise FileNotFoundError(
-            "configured GrandTour missions are not materialized: "
-            + ", ".join(str(path) for path in missing)
-        )
+    _, mission_dirs = _mission_dirs(data_root, data_config.get("missions"))
     readers = [
         MissionReader(
             mission_dir,
@@ -595,6 +644,7 @@ def build_sequence_dataset(
         tick_hz=tick_hz,
         control_hz=control_hz,
         action_frames=action_frames,
+        max_sequences=max_sequences,
         load_images=load_images,
     )
 

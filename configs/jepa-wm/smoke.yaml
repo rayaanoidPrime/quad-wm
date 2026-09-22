@@ -2,18 +2,13 @@ name: jepa-infrastructure-smoke
 seed: 4551
 steps: 20
 
-# External roots are intentionally supplied by the shell environment or Slurm.
+# CPU-only infrastructure smoke config. The GPU/data pipeline smoke uses
+# baseline_smoke.yaml and configs/data/grandtour_smoke.yaml.
 data_root: ${QUADWM_DATA_ROOT:-/path/to/external/data}
 run_root: ${QUADWM_RUN_ROOT:-runs}
-data_config: configs/data/grandtour_smoke.yaml
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-false}
   project: quad-wm
   name: jepa-smoke
   mode: ${WANDB_MODE:-offline}
-
-wm:
-  name: jepa
-  observation: depth_plus_proprioception
-  platform: anymal_d

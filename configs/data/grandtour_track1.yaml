@@ -1,0 +1,16 @@
+data_root: ${GRANDTOUR_ROOT:-/path/to/grand_tour_dataset}
+
+# No missions key means: enumerate, download, and train on every mission.
+download: true
+download_topics:
+  - alphasense_front_center
+  - anymal_state_state_estimator
+  - anymal_state_actuator
+observation: rgb_plus_proprioception
+platform: anymal_d
+tick_hz: 5
+control_hz: 50
+action_frames: 10
+max_gap_ms: 50
+sync_rate_hz: 10
+calibration: per_mission

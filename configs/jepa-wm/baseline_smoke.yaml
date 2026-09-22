@@ -1,14 +1,14 @@
-name: track1-baseline-jepa
+name: baseline-jepa-smoke
 seed: 4551
 
 run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
 checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
-data_config: configs/data/grandtour_track1.yaml
+data_config: configs/data/grandtour_smoke.yaml
 
 cache:
   mode: auto
-  root: ${QUADWM_CACHE_ROOT:-/scratch/quad-wm/cache/vjepa21}
-  batch_size: 16
+  root: ${QUADWM_CACHE_ROOT:-/scratch/quad-wm/cache/vjepa21-smoke}
+  batch_size: 4
 
 model:
   baseline: true
@@ -18,16 +18,17 @@ model:
   proprio_dim: 33
   proprio_embed_dim: 16
   action_dim: 120
-  context_steps: 7
-  rollout_steps: 6
-  rollout_context: 3
-  predictor_depth: 12
+  context_steps: 1
+  rollout_steps: 1
+  rollout_context: 1
+  predictor_depth: 1
   predictor_heads: 16
 
 training:
-  epochs: 10
+  epochs: 1
+  max_steps: 3
   per_gpu_batch_size: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 1
   num_workers: 0
   precision: bf16
   learning_rate: 0.0005
@@ -36,7 +37,7 @@ training:
   resume: ""
 
 wandb:
-  enabled: ${QUADWM_WANDB_ENABLED:-true}
+  enabled: ${QUADWM_WANDB_ENABLED:-false}
   project: quad-wm
-  name: track1-baseline-jepa
-  mode: ${WANDB_MODE:-online}
+  name: track1-baseline-jepa-smoke
+  mode: ${WANDB_MODE:-offline}

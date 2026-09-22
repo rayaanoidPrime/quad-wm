@@ -80,9 +80,13 @@ def smoke(config: dict | None = None) -> None:
 
     data_cfg = config["data"]
     wm_cfg = config["wm"]
-    data_root = config["data_root"]
+    data_root = config["data"].get("data_root", config.get("data_root", "data/grandtour"))
 
-    fetch_missions(data_cfg["missions"], data_root)
+    fetch_missions(
+        data_cfg.get("missions"),
+        data_root,
+        data_cfg.get("download_topics"),
+    )
 
     dataset = build_dataset(
         data_cfg,
@@ -154,8 +158,13 @@ def smoke(config: dict | None = None) -> None:
 def prepare(config: dict) -> None:
     checkpoint = ensure_vjepa21_checkpoint(config.get("checkpoint_root", "checkpoints"))
     data_cfg = config.get("data", {})
-    if data_cfg.get("download", False) and data_cfg.get("missions"):
-        fetch_missions(data_cfg["missions"], config["data_root"])
+    if data_cfg.get("download", False):
+        data_root = data_cfg.get("data_root", config.get("data_root", "data/grandtour"))
+        fetch_missions(
+            data_cfg.get("missions"),
+            data_root,
+            data_cfg.get("download_topics"),
+        )
     print(f"checkpoint ready: {checkpoint}")
 
 

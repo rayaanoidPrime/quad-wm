@@ -39,6 +39,13 @@ def load_config(path: Path | None) -> dict[str, Any]:
     config["config_path"] = str(path)
     if "data_config" in config:
         data_path = Path(config["data_config"])
-        config["data"] = yaml.safe_load(data_path)
+        if not data_path.is_absolute() and not data_path.exists():
+            data_path = path.parent / data_path
+        if not data_path.exists():
+            raise FileNotFoundError(data_path)
+        data_text = _expand_environment(data_path.read_text(encoding="utf-8"))
+        config["data"] = yaml.safe_load(data_text) or {}
+        if not isinstance(config["data"], dict):
+            raise TypeError(f"data config must be a mapping: {data_path}")
         config["data"]["config_path"] = str(data_path)
     return config

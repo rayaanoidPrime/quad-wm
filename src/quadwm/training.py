@@ -160,8 +160,8 @@ def train(config: dict) -> None:
     _seed(int(config.get("seed", 4551)), rank)
     run_root = Path(config.get("run_root", "runs")) / config.get("name", "jepa-baseline")
     checkpoint_root = Path(config.get("checkpoint_root", "checkpoints"))
-    data_root = Path(config["data_root"])
     data_cfg = config["data"]
+    data_root = Path(data_cfg.get("data_root", config.get("data_root", "data/grandtour")))
     model_cfg = {**config["model"], "baseline": True}
     if rank == 0:
         run_root.mkdir(parents=True, exist_ok=True)
@@ -169,7 +169,11 @@ def train(config: dict) -> None:
             json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8"
         )
         if data_cfg.get("download", True):
-            fetch_missions(data_cfg["missions"], data_root)
+            fetch_missions(
+                data_cfg.get("missions"),
+                data_root,
+                data_cfg.get("download_topics"),
+            )
         ensure_vjepa21_checkpoint(checkpoint_root)
     _barrier()
 
@@ -183,6 +187,7 @@ def train(config: dict) -> None:
         tick_hz=float(data_cfg["tick_hz"]),
         control_hz=float(data_cfg["control_hz"]),
         action_frames=int(data_cfg["action_frames"]),
+        max_sequences=data_cfg.get("max_sequences"),
         load_images=True,
     )
     if not len(dataset):
@@ -254,6 +259,7 @@ def train(config: dict) -> None:
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )
     epochs = int(config["training"].get("epochs", 10))
+    max_steps = int(config["training"].get("max_steps", 0))
     accumulation = int(config["training"].get("gradient_accumulation_steps", 1))
     precision = torch.bfloat16 if config["training"].get("precision", "bf16") == "bf16" else torch.float16
     global_step = 0
@@ -264,6 +270,8 @@ def train(config: dict) -> None:
             sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(loader):
+            if max_steps and global_step >= max_steps:
+                break
             if use_cache:
                 visual_tokens = _batch_tokens(batch, caches, device)
             else:
@@ -292,6 +300,8 @@ def train(config: dict) -> None:
                     wandb_run.log(metric)
         if rank == 0:
             save_checkpoint(run_root / "last.pt", model=model, optimizer=optimizer, epoch=epoch + 1, config=config)
+        if max_steps and global_step >= max_steps:
+            break
     if metrics_stream is not None:
         metrics_stream.close()
     if rank == 0 and wandb_run is not None:

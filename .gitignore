@@ -51,6 +51,10 @@ reference
 # ignore patterns above, but must remain reviewable in Git.
 !src/quadwm/data/
 !src/quadwm/data/**
+src/quadwm/data/__pycache__/
+!configs/data/
+!configs/data/**
+configs/data/__pycache__/
 docs/adr/
 
 
