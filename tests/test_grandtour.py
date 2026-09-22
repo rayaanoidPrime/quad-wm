@@ -120,7 +120,7 @@ def test_extract_tars_handles_grandtour_data_prefix(tmp_path):
     source = tmp_path / "source.txt"
     source.write_text("ok", encoding="utf-8")
     stream = tarfile.open(archive, "w")
-    stream.add(source, arcname="mission-a/data/topic.txt")
+    stream.add(source, arcname="data/topic.txt")
     stream.close()
 
     output = tmp_path / "output"

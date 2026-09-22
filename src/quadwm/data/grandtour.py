@@ -105,26 +105,40 @@ def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | N
     pattern = to_regex(allow_patterns) if allow_patterns else None
     files = [
         f for f in Path(cache_dir).rglob("*")
-        if f.is_file() and (pattern is None or pattern.match(str(f)))
+        if f.is_file() and (pattern is None or pattern.match(f.as_posix()))
     ]
 
-    for f in [x for x in files if x.suffix == ".tar"]:
+    def is_tar(path: Path) -> bool:
+        return path.name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2"))
+
+    for f in [x for x in files if is_tar(x)]:
         dest = dest_dir / f.relative_to(cache_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(f, "r") as tar:
+        with tarfile.open(f, "r:*") as tar:
             members = tar.getmembers()
             relative_archive = f.relative_to(cache_dir)
             mission_name = relative_archive.parts[0]
             mission_prefix = mission_name + "/"
+            archive_parent = "/".join(relative_archive.parts[1:-1])
             archive_has_mission_prefix = any(
                 member.name == mission_name
                 or member.name.startswith(mission_prefix)
                 for member in members
             )
-            extract_root = dest_dir if archive_has_mission_prefix else dest.parent
+            archive_has_parent_prefix = archive_parent and any(
+                member.name == archive_parent
+                or member.name.startswith(archive_parent + "/")
+                for member in members
+            )
+            if archive_has_mission_prefix:
+                extract_root = dest_dir
+            elif archive_has_parent_prefix:
+                extract_root = dest_dir / mission_name
+            else:
+                extract_root = dest.parent
             tar.extractall(path=extract_root)
 
-    for f in [x for x in files if x.suffix != ".tar" and x.is_file()]:
+    for f in [x for x in files if not is_tar(x) and x.is_file()]:
         dest = dest_dir / f.relative_to(cache_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, dest)
