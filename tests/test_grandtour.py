@@ -129,6 +129,26 @@ def test_extract_tars_handles_grandtour_data_prefix(tmp_path):
     assert (output / "mission-a" / "data" / "topic.txt").read_text() == "ok"
 
 
+def test_mission_ready_handles_implicit_v2_group(tmp_path):
+    """GrandTour's data root is an implicit Zarr v2 group: topics are
+    sub-groups but there is no `.zgroup` marker at `data/`. Zarr 3 refuses to
+    open that, so readiness must materialize the marker instead of failing."""
+    zarr = pytest.importorskip("zarr")
+    from quadwm.data.grandtour import _mission_ready
+
+    mission = tmp_path / "mission-a"
+    root = zarr.open_group(store=mission / "data", mode="w", zarr_format=2)
+    root.create_group("alphasense_front_center").create_array(
+        "timestamp", data=np.array([0.0])
+    )
+    (mission / "images" / "alphasense_front_center").mkdir(parents=True)
+    # Strip the marker to reproduce the published implicit-group layout.
+    (mission / "data" / ".zgroup").unlink()
+
+    assert _mission_ready(mission, ["alphasense_front_center"]) is True
+    assert (mission / "data" / ".zgroup").exists()
+
+
 def test_split_mission_names_is_seeded_and_mission_level():
     first = split_mission_names(["c", "a", "b", "d"], seed=12)
     second = split_mission_names(["d", "b", "a", "c"], seed=12)

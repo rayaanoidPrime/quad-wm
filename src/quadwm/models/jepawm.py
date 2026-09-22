@@ -10,6 +10,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+# Shared with models.shared.ensure_vjepa21_checkpoint, which downloads this file.
+VJEPA21_FILENAME = "vjepa2_1_vitb_dist_vitG_384.pt"
+
 
 def _tokens(output: object) -> Tensor:
     if isinstance(output, (tuple, list)):
@@ -30,25 +33,43 @@ class VJEPA21Encoder(nn.Module):
         super().__init__()
         checkpoint_root = Path(checkpoint_root)
         checkpoint_root.mkdir(parents=True, exist_ok=True)
-        # The official hub entry constructs the exact architecture and loads
-        # this file from Torch's cache.  shared.ensure_checkpoint puts it there.
-        torch_checkpoint = checkpoint_root / "torch" / "hub" / "checkpoints"
+        # Point torch.hub at our storage *before* resolving its cache dir, then
+        # seed the file where torch.hub.load_state_dict_from_url actually looks
+        # for it: $TORCH_HOME/hub/checkpoints/<basename>.  Seeding the wrong
+        # path makes the official hub entry re-download (or, since upstream
+        # vjepa2 main points VJEPA_BASE_URL at localhost, fail with a 404).
+        os.environ["TORCH_HOME"] = str(checkpoint_root)
+        torch_checkpoint = Path(torch.hub.get_dir()) / "checkpoints"
         torch_checkpoint.mkdir(parents=True, exist_ok=True)
-        local_checkpoint = checkpoint_root / "vjepa2_1_vitb_dist_vitG_384.pt"
+        local_checkpoint = checkpoint_root / VJEPA21_FILENAME
+        if not local_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"V-JEPA 2.1 checkpoint not found at {local_checkpoint}; "
+                "run `quadwm prepare` first"
+            )
         cached_checkpoint = torch_checkpoint / local_checkpoint.name
         if not cached_checkpoint.exists():
+            # Unique temp + atomic replace so concurrent ranks can't race.
+            temporary = cached_checkpoint.with_name(
+                f"{cached_checkpoint.name}.{os.getpid()}.part"
+            )
             try:
-                os.link(local_checkpoint, cached_checkpoint)
+                os.link(local_checkpoint, temporary)
             except OSError:
-                shutil.copy2(local_checkpoint, cached_checkpoint)
-        os.environ["TORCH_HOME"] = str(checkpoint_root)
+                shutil.copy2(local_checkpoint, temporary)
+            os.replace(temporary, cached_checkpoint)
         loaded = torch.hub.load(
             "facebookresearch/vjepa2",
             "vjepa2_1_vit_base_384",
             pretrained=True,
             source="github",
-            num_frames=1,
-            tubelet_size=1,
+            # The published checkpoint carries the tubelet-2 video patch_embed
+            # plus the tubelet-1 image patch_embed.  Build the video-temporal
+            # stem (num_frames>1) so both keys exist; the hub's
+            # img_temporal_dim_size=1 then routes single-frame forward passes
+            # through patch_embed_img at inference.
+            num_frames=2,
+            tubelet_size=2,
         )
         self.encoder = loaded[0] if isinstance(loaded, tuple) else loaded
         self.encoder.eval()

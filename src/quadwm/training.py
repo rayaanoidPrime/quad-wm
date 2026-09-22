@@ -110,7 +110,9 @@ def _build_token_cache(
         if not image_ids:
             raise ValueError(f"no cacheable images found for mission {mission}")
         first = _prepare_images(
-            torch.from_numpy(np.stack([reader.load_image(i) for i in image_ids[:1]])).unsqueeze(1),
+            torch.from_numpy(
+                np.stack([reader.load_image(i) for i in image_ids[:1]])
+            ).permute(0, 3, 1, 2).unsqueeze(1),
             device,
             image_size,
         )[:, 0]
@@ -124,7 +126,11 @@ def _build_token_cache(
         for start in range(0, len(image_ids), batch_size):
             ids = image_ids[start : start + batch_size]
             images = np.stack([reader.load_image(image_id) for image_id in ids])
-            images = _prepare_images(torch.from_numpy(images).unsqueeze(1), device, image_size)[:, 0]
+            images = _prepare_images(
+                torch.from_numpy(images).permute(0, 3, 1, 2).unsqueeze(1),
+                device,
+                image_size,
+            )[:, 0]
             tokens[start : start + len(ids)] = encoder(images).float().cpu().numpy().astype(np.float16)
         tokens.flush()
         metadata_temporary.write_text(

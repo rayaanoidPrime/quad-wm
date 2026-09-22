@@ -225,13 +225,28 @@ def split_mission_names(names: list[str], seed: int, eval_fraction: float = 0.2)
     return shuffled[eval_count:], shuffled[:eval_count]
 
 
+# GrandTour publishes Zarr v2 stores: topics are sub-groups directly under
+# <mission>/data/, but the data root itself has no `.zgroup` marker (an
+# implicit v2 group). Zarr 3 requires explicit metadata and refuses to open
+# it, so materialize the missing marker before opening.
+_IMPLICIT_GROUP_MARKER = '{"zarr_format": 2}\n'
+
+
+def _open_mission_data(mission: Path):
+    """Open a mission's `data/` root, bridging the implicit v2 group gap."""
+    data_dir = mission / "data"
+    if not (data_dir / ".zgroup").exists() and not (data_dir / "zarr.json").exists():
+        (data_dir / ".zgroup").write_text(_IMPLICIT_GROUP_MARKER, encoding="utf-8")
+    return zarr.open_group(store=data_dir, mode="r")
+
+
 def _mission_ready(mission: Path, topics: list[str] | None) -> bool:
     if not (mission / "data").is_dir():
         return False
     if not topics:
         return True
     try:
-        root = zarr.open_group(store=mission / "data", mode="r")
+        root = _open_mission_data(mission)
         if any(topic not in root for topic in topics):
             return False
     except (KeyError, OSError, ValueError):
@@ -338,7 +353,7 @@ class MissionReader:
     max_gap_s: float = 0.05  # drop a sample if the nearest source is farther than this
 
     def __post_init__(self) -> None:
-        self.root = zarr.open_group(store=self.mission_dir / "data", mode="r")
+        self.root = _open_mission_data(self.mission_dir)
         self.depth_group = self.root[self.depth_topic]
         self.proprio_group = self.root[self.proprio_topic]
         self.actuator_group = self.root[self.actuator_topic]
@@ -441,7 +456,7 @@ class Track1MissionDataset(Dataset):
 
     def __init__(self, mission: str | Path):
         self.mission_dir = Path(mission)
-        self.root = zarr.open_group(store=self.mission_dir / "data", mode="r")
+        self.root = _open_mission_data(self.mission_dir)
         self.depth = self.root["depth_camera_front_upper"]
         self.state = self.root["anymal_state_state_estimator"]
         self.actuator = self.root["anymal_state_actuator"]

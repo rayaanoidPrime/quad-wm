@@ -9,9 +9,8 @@ from typing import Any
 
 import torch
 
-from .jepawm import JEPAWorldModel
+from .jepawm import JEPAWorldModel, VJEPA21_FILENAME
 
-VJEPA21_FILENAME = "vjepa2_1_vitb_dist_vitG_384.pt"
 VJEPA21_URL = f"https://dl.fbaipublicfiles.com/vjepa2/{VJEPA21_FILENAME}"
 
 
