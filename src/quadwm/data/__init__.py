@@ -10,6 +10,7 @@ from .grandtour import (
   inspect_mission,
   inspect_root,
   materialize_mission,
+  materialized_missions,
   split_mission_names,
   verify_joint_order_consistency,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "inspect_mission",
     "inspect_root",
     "materialize_mission",
+    "materialized_missions",
     "split_mission_names",
     "verify_joint_order_consistency",
 ]

@@ -11,6 +11,21 @@ from quadwm.data.grandtour import (
 )
 
 
+def test_remote_missions_skips_map_only_folders():
+    from quadwm.data.grandtour import _remote_missions
+
+    files = [
+        "2024-11-02-17-18-32/data/alphasense_front_center.tar",
+        "2024-11-02-17-18-32/metadata/alphasense_front_center.yaml",
+        # Timestamp-named folder that only holds a point-cloud map.
+        "2024-10-29-09-53-44/point_cloud_maps/2024-10-29-09-53-44_dlio.ply",
+        "README.md",
+    ]
+
+    assert _remote_missions(files, ["alphasense_front_center"]) == ["2024-11-02-17-18-32"]
+    assert _remote_missions(files, None) == ["2024-11-02-17-18-32"]
+
+
 def test_inspect_mission_reports_topics_and_images(tmp_path):
     mission = tmp_path / "2024-11-02-17-18-32"
     metadata = mission / "metadata"

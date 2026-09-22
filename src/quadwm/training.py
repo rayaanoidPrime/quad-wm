@@ -13,9 +13,15 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from .data import build_sequence_dataset, fetch_missions
+from .data import (
+    build_sequence_dataset,
+    fetch_missions,
+    materialized_missions,
+    split_mission_names,
+)
 from .models import (
     VJEPA21Encoder,
     build_model,
@@ -141,9 +147,10 @@ def _build_token_cache(
         os.replace(metadata_temporary, cache_root / f"{mission}.json")
 
 
-def _cache_fits(dataset, cache_root: Path, tokens: int, dim: int) -> bool:
+def _cache_fits(datasets, cache_root: Path, tokens: int, dim: int) -> bool:
     ids = sum(
         len({image_id for index in dataset.index if index[0] == reader_index for image_id in index[1]})
+        for dataset in datasets
         for reader_index in range(len(dataset.readers))
     )
     required = ids * tokens * dim * 2
@@ -159,6 +166,56 @@ def _batch_tokens(batch: dict, caches: list[TokenCache], device: torch.device) -
     for row, mission_id in enumerate(mission_ids):
         rows.append(caches[mission_id].get(image_ids[row]))
     return torch.from_numpy(np.stack(rows)).to(device, non_blocking=True)
+
+
+def _batch_visual_tokens(
+    model: torch.nn.Module,
+    batch: dict,
+    caches: list[TokenCache],
+    device: torch.device,
+    image_size: int,
+    use_cache: bool,
+) -> torch.Tensor:
+    if use_cache:
+        return _batch_tokens(batch, caches, device)
+    module = model.module if hasattr(model, "module") else model
+    images = _prepare_images(batch["images"], device, image_size)
+    batch_size, frames = images.shape[:2]
+    tokens = module.encode_visual(images.reshape(batch_size * frames, *images.shape[2:]))
+    return tokens.reshape(batch_size, frames, *tokens.shape[1:])
+
+
+@torch.no_grad()
+def _evaluate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    caches: list[TokenCache],
+    device: torch.device,
+    precision: torch.dtype,
+    image_size: int,
+    use_cache: bool,
+    max_batches: int,
+) -> dict[str, float]:
+    """Held-out E1.1 pass: per-step error, persistence baseline, proprio variance."""
+    module = model.module if hasattr(model, "module") else model
+    was_training = module.training
+    module.eval()
+    totals: dict[str, float] = {}
+    batches = 0
+    for batch in loader:
+        visual_tokens = _batch_visual_tokens(model, batch, caches, device, image_size, use_cache)
+        batch["proprio"] = batch["proprio"].to(device, non_blocking=True)
+        batch["actions"] = batch["actions"].to(device, non_blocking=True)
+        with torch.autocast(device_type="cuda", dtype=precision):
+            metrics = module.evaluate(visual_tokens, batch["proprio"], batch["actions"])
+        for key, value in metrics.items():
+            totals[key] = totals.get(key, 0.0) + value
+        batches += 1
+        if max_batches and batches >= max_batches:
+            break
+    if was_training:
+        module.train()
+    return {key: value / max(batches, 1) for key, value in totals.items()}
 
 
 def train(config: dict) -> None:
@@ -191,6 +248,30 @@ def train(config: dict) -> None:
         ensure_vjepa21_checkpoint(checkpoint_root)
     _barrier()
 
+    eval_fraction = float(data_cfg.get("eval_fraction", 0.0))
+    train_missions = data_cfg.get("missions")
+    eval_missions: list[str] | None = None
+    if eval_fraction > 0:
+        available = materialized_missions(data_root, data_cfg.get("missions"))
+        if len(available) >= 2:
+            train_missions, eval_missions = split_mission_names(
+                available,
+                int(data_cfg.get("split_seed", config.get("seed", 4551))),
+                eval_fraction,
+            )
+        elif rank == 0:
+            print(
+                f"stage=split status=skipped available={len(available)} "
+                "reason=need at least 2 missions to hold one out",
+                flush=True,
+            )
+    if rank == 0 and eval_missions is not None:
+        print(
+            f"stage=split train_missions={len(train_missions)} "
+            f"eval_missions={len(eval_missions)} eval={','.join(eval_missions)}",
+            flush=True,
+        )
+
     dataset = build_sequence_dataset(
         data_cfg,
         observation=data_cfg["observation"],
@@ -203,6 +284,7 @@ def train(config: dict) -> None:
         action_frames=int(data_cfg["action_frames"]),
         max_sequences=data_cfg.get("max_sequences"),
         load_images=True,
+        missions=train_missions,
     )
     if not len(dataset):
         raise ValueError("sequence dataset is empty")
@@ -213,6 +295,31 @@ def train(config: dict) -> None:
             flush=True,
         )
 
+    eval_dataset = None
+    if eval_missions:
+        eval_dataset = build_sequence_dataset(
+            data_cfg,
+            observation=data_cfg["observation"],
+            platform=data_cfg["platform"],
+            data_root=data_root,
+            context_steps=int(model_cfg["context_steps"]),
+            rollout_steps=int(model_cfg["rollout_steps"]),
+            tick_hz=float(data_cfg["tick_hz"]),
+            control_hz=float(data_cfg["control_hz"]),
+            action_frames=int(data_cfg["action_frames"]),
+            max_sequences=data_cfg.get("eval_max_sequences"),
+            load_images=True,
+            missions=eval_missions,
+        )
+        if not len(eval_dataset):
+            raise ValueError("held-out eval dataset is empty")
+        if rank == 0:
+            print(
+                f"stage=eval_dataset status=ready missions={len(eval_dataset.readers)} "
+                f"sequences={len(eval_dataset)}",
+                flush=True,
+            )
+
     cache_cfg = config.get("cache", {})
     use_cache = cache_cfg.get("mode", "auto") != "off"
     cache_root = Path(cache_cfg.get("root", data_root / "quadwm-token-cache"))
@@ -220,7 +327,7 @@ def train(config: dict) -> None:
     image_size = int(model_cfg.get("image_size", 384))
     if use_cache and rank == 0:
         use_cache = _cache_fits(
-            dataset,
+            [dataset] + ([eval_dataset] if eval_dataset is not None else []),
             cache_root,
             tokens=int(model_cfg["tokens_per_frame"]),
             dim=int(model_cfg["visual_dim"]),
@@ -235,6 +342,15 @@ def train(config: dict) -> None:
                 int(cache_cfg.get("batch_size", 16)),
                 image_size,
             )
+            if eval_dataset is not None:
+                _build_token_cache(
+                    eval_dataset,
+                    encoder,
+                    cache_root,
+                    device,
+                    int(cache_cfg.get("batch_size", 16)),
+                    image_size,
+                )
             del encoder
             torch.cuda.empty_cache()
     if world_size > 1:
@@ -246,6 +362,20 @@ def train(config: dict) -> None:
         print(f"stage=feature_cache status={'enabled' if use_cache else 'disabled'}", flush=True)
     dataset.load_images = not use_cache
     caches = [TokenCache(cache_root, reader.mission_dir.name) for reader in dataset.readers] if use_cache else []
+    eval_loader = None
+    eval_caches: list[TokenCache] = []
+    if eval_dataset is not None:
+        eval_dataset.load_images = not use_cache
+        eval_caches = (
+            [TokenCache(cache_root, reader.mission_dir.name) for reader in eval_dataset.readers]
+            if use_cache
+            else []
+        )
+        eval_loader = eval_dataset.loader(
+            batch_size=int(config["training"].get("per_gpu_batch_size", 1)),
+            shuffle=False,
+            num_workers=0,
+        )
     visual_encoder = None if use_cache else VJEPA21Encoder(checkpoint_root)
     model = build_model(model_cfg, checkpoint_root, visual_encoder=visual_encoder).to(device)
     if world_size > 1:
@@ -294,6 +424,8 @@ def train(config: dict) -> None:
     epochs = int(config["training"].get("epochs", 10))
     max_steps = int(config["training"].get("max_steps", 0))
     log_every_steps = max(1, int(config["training"].get("log_every_steps", 10)))
+    eval_every_steps = max(0, int(config["training"].get("eval_every_steps", 0)))
+    eval_max_batches = max(0, int(config["training"].get("eval_max_batches", 8)))
     accumulation = int(config["training"].get("gradient_accumulation_steps", 1))
     precision = torch.bfloat16 if config["training"].get("precision", "bf16") == "bf16" else torch.float16
     global_step = 0
@@ -330,8 +462,6 @@ def train(config: dict) -> None:
                 if rank == 0 and metrics_stream is not None:
                     metrics_stream.write(json.dumps(metric) + "\n")
                     metrics_stream.flush()
-                if rank == 0 and wandb_run is not None:
-                    wandb_run.log(metric)
                 if rank == 0 and (
                     global_step == 1 or global_step % log_every_steps == 0
                 ):
@@ -341,6 +471,48 @@ def train(config: dict) -> None:
                         f"proprio_loss={metric['proprio_loss']:.6f}",
                         flush=True,
                     )
+                    if wandb_run is not None:
+                        # Explicit global step so the W&B x-axis matches training
+                        # progress instead of W&B's internal log counter.
+                        wandb_run.log(
+                            {k: v for k, v in metric.items() if k not in ("step", "timestamp")},
+                            step=global_step,
+                        )
+                do_eval = (
+                    eval_loader is not None
+                    and eval_every_steps
+                    and (global_step == 1 or global_step % eval_every_steps == 0)
+                )
+                if do_eval and rank == 0:
+                    eval_metrics = _evaluate(
+                        model,
+                        eval_loader,
+                        eval_caches,
+                        device,
+                        precision,
+                        image_size,
+                        use_cache,
+                        eval_max_batches,
+                    )
+                    eval_record = {f"eval/{key}": value for key, value in eval_metrics.items()}
+                    if metrics_stream is not None:
+                        metrics_stream.write(
+                            json.dumps(eval_record | {"step": global_step, "timestamp": time.time()})
+                            + "\n"
+                        )
+                        metrics_stream.flush()
+                    if wandb_run is not None:
+                        wandb_run.log(eval_record, step=global_step)
+                    print(
+                        f"stage=eval step={global_step} "
+                        f"visual_mse={eval_metrics['visual_mse']:.6f} "
+                        f"proprio_mse={eval_metrics['proprio_mse']:.6f} "
+                        f"persistence_visual_mse={eval_metrics['step_1/persistence_visual_mse']:.6f} "
+                        f"proprio_variance={eval_metrics['proprio_variance']:.6f}",
+                        flush=True,
+                    )
+                if do_eval:
+                    _barrier()
         if rank == 0:
             save_checkpoint(run_root / "last.pt", model=model, optimizer=optimizer, epoch=epoch + 1, config=config)
             print(f"stage=checkpoint status=saved path={run_root / 'last.pt'}", flush=True)

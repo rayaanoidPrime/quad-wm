@@ -289,6 +289,51 @@ class JEPAWorldModel(nn.Module):
         losses["proprio_loss"] = torch.stack(proprio_losses).mean()
         return losses
 
+    @torch.no_grad()
+    def evaluate(
+        self, visual_tokens: Tensor, proprio: Tensor, actions: Tensor
+    ) -> dict[str, float]:
+        """E1.1 metrics: per-rollout-step error, persistence baseline, proprio variance.
+
+        Persistence predicts the context's last observation for every future step
+        (the gate the predictor must beat on held-out missions).
+        """
+        observations = self.encode_observation(visual_tokens, proprio)
+        context_steps = self.context_steps
+        context = observations[:, :context_steps]
+        rollout_actions = actions[:, context_steps - 1 :]
+        persistence = observations[:, context_steps - 1]
+        metrics: dict[str, float] = {}
+        visual_errors = []
+        proprio_errors = []
+        for step, action in enumerate(rollout_actions.unbind(dim=1)):
+            predictor_context = context if step == 0 else context[:, -self.rollout_context :]
+            prediction = self.predict_next(predictor_context, action)
+            target = observations[:, context_steps + step]
+            prefix = f"step_{step + 1}"
+            visual = F.mse_loss(prediction[..., : self.visual_dim], target[..., : self.visual_dim])
+            prop = F.mse_loss(prediction[..., self.visual_dim :], target[..., self.visual_dim :])
+            metrics[f"{prefix}/visual_mse"] = float(visual)
+            metrics[f"{prefix}/proprio_mse"] = float(prop)
+            metrics[f"{prefix}/persistence_visual_mse"] = float(
+                F.mse_loss(persistence[..., : self.visual_dim], target[..., : self.visual_dim])
+            )
+            metrics[f"{prefix}/persistence_proprio_mse"] = float(
+                F.mse_loss(persistence[..., self.visual_dim :], target[..., self.visual_dim :])
+            )
+            visual_errors.append(visual)
+            proprio_errors.append(prop)
+            context = torch.cat(
+                (context[:, -self.rollout_context + 1 :], prediction.unsqueeze(1)), dim=1
+            )
+        metrics["visual_mse"] = float(torch.stack(visual_errors).mean())
+        metrics["proprio_mse"] = float(torch.stack(proprio_errors).mean())
+        # Collapse signature from recipe §7: the proprio slice's variance should stay > 0.
+        metrics["proprio_variance"] = float(
+            observations[..., self.visual_dim :].var(dim=(0, 1)).mean()
+        )
+        return metrics
+
     def training_step(self, batch: dict[str, Tensor], _: float = 0.0) -> dict[str, Tensor]:
         if "depth_t" in batch:
             prediction = self.toy_encoder(batch["depth_t"].float())

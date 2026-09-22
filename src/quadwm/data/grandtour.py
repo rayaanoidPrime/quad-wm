@@ -28,6 +28,7 @@ instances of this class, not built here.
 from __future__ import annotations
 
 import bisect
+import fnmatch
 import random
 import re
 import shutil
@@ -240,6 +241,33 @@ def _open_mission_data(mission: Path):
     return zarr.open_group(store=data_dir, mode="r")
 
 
+def _remote_missions(
+    remote_files: list[str], download_topics: list[str] | None
+) -> list[str]:
+    """Timestamp-named missions that actually contain downloadable topics.
+
+    The repo also stores map-only folders such as
+    ``<timestamp>/point_cloud_maps/<timestamp>_dlio.ply``.  Those match the
+    timestamp regex but have no training data, so require at least one file
+    matching the download patterns (or a ``data/`` subtree when no topics are
+    configured).
+    """
+    missions: set[str] = set()
+    for path in remote_files:
+        if "/" not in path:
+            continue
+        mission, relative = path.split("/", 1)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}", mission):
+            continue
+        if download_topics:
+            wanted = any(fnmatch.fnmatch(relative, f"*{topic}*") for topic in download_topics)
+        else:
+            wanted = relative.startswith("data/")
+        if wanted:
+            missions.add(mission)
+    return sorted(missions)
+
+
 def _mission_ready(mission: Path, topics: list[str] | None) -> bool:
     if not (mission / "data").is_dir():
         return False
@@ -271,15 +299,7 @@ def fetch_missions(
     selected = _mission_names(missions)
     if missions is None:
         remote_files = list_repo_files(repo_id=GRANDTOUR_REPO_ID, repo_type="dataset")
-        selected = sorted(
-            {
-                mission
-                for path in remote_files
-                if "/" in path
-                for mission in [path.split("/", 1)[0]]
-                if re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}", mission)
-            }
-        )
+        selected = _remote_missions(remote_files, download_topics)
     if not selected:
         raise ValueError("GrandTour download selection contains no missions")
     root.mkdir(parents=True, exist_ok=True)
@@ -336,6 +356,14 @@ def _mission_dirs(
             + ", ".join(str(path) for path in missing)
         )
     return root, mission_dirs
+
+
+def materialized_missions(
+    data_root: str | Path, missions: list[str] | str | None = None
+) -> list[str]:
+    """Names of materialized missions under ``data_root`` (for train/eval splits)."""
+    _, mission_dirs = _mission_dirs(data_root, missions)
+    return [path.name for path in mission_dirs]
 
 
 # --------------------------------------------------------------------------
@@ -797,9 +825,11 @@ def build_sequence_dataset(
     action_frames: int,
     max_sequences: int | None = None,
     load_images: bool = True,
+    missions: list[str] | str | None = None,
 ) -> GrandTourSequenceDataset:
     topics = resolve_topics(observation, platform)
-    _, mission_dirs = _mission_dirs(data_root, data_config.get("missions"))
+    selected = missions if missions is not None else data_config.get("missions")
+    _, mission_dirs = _mission_dirs(data_root, selected)
     readers = [
         MissionReader(
             mission_dir,
