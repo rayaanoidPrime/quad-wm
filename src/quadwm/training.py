@@ -164,6 +164,12 @@ def _batch_tokens(batch: dict, caches: list[TokenCache], device: torch.device) -
 def train(config: dict) -> None:
     rank, world_size, local_rank, device = _distributed()
     _seed(int(config.get("seed", 4551)), rank)
+    if rank == 0:
+        print(
+            f"stage=train status=starting device={torch.cuda.get_device_name(device)} "
+            f"world_size={world_size}",
+            flush=True,
+        )
     run_root = Path(config.get("run_root", "runs")) / config.get("name", "jepa-baseline")
     checkpoint_root = Path(config.get("checkpoint_root", "checkpoints"))
     data_cfg = config["data"]
@@ -175,11 +181,13 @@ def train(config: dict) -> None:
             json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8"
         )
         if data_cfg.get("download", True):
+            print("stage=data status=checking", flush=True)
             fetch_missions(
                 data_cfg.get("missions"),
                 data_root,
                 data_cfg.get("download_topics"),
             )
+            print("stage=data status=ready", flush=True)
         ensure_vjepa21_checkpoint(checkpoint_root)
     _barrier()
 
@@ -198,6 +206,12 @@ def train(config: dict) -> None:
     )
     if not len(dataset):
         raise ValueError("sequence dataset is empty")
+    if rank == 0:
+        print(
+            f"stage=dataset status=ready missions={len(dataset.readers)} "
+            f"sequences={len(dataset)}",
+            flush=True,
+        )
 
     cache_cfg = config.get("cache", {})
     use_cache = cache_cfg.get("mode", "auto") != "off"
@@ -228,12 +242,17 @@ def train(config: dict) -> None:
         dist.broadcast(flag, src=0)
         use_cache = bool(flag.item())
     _barrier()
+    if rank == 0:
+        print(f"stage=feature_cache status={'enabled' if use_cache else 'disabled'}", flush=True)
     dataset.load_images = not use_cache
     caches = [TokenCache(cache_root, reader.mission_dir.name) for reader in dataset.readers] if use_cache else []
     visual_encoder = None if use_cache else VJEPA21Encoder(checkpoint_root)
     model = build_model(model_cfg, checkpoint_root, visual_encoder=visual_encoder).to(device)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
+    if rank == 0:
+        parameters = sum(parameter.numel() for parameter in model.parameters())
+        print(f"stage=model status=ready trainable_parameters={parameters}", flush=True)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=float(config["training"].get("learning_rate", 5e-4)),
@@ -258,6 +277,14 @@ def train(config: dict) -> None:
     }
     wandb_run = init_wandb(config, metadata=metadata, run_dir=run_root) if rank == 0 else None
     if rank == 0:
+        if wandb_run is None:
+            print("stage=wandb status=disabled", flush=True)
+        else:
+            print(
+                f"stage=wandb status=started url={getattr(wandb_run, 'url', None)}",
+                flush=True,
+            )
+    if rank == 0:
         if wandb_run is not None:
             metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
             metadata["wandb_url"] = getattr(wandb_run, "url", None)
@@ -266,6 +293,7 @@ def train(config: dict) -> None:
         )
     epochs = int(config["training"].get("epochs", 10))
     max_steps = int(config["training"].get("max_steps", 0))
+    log_every_steps = max(1, int(config["training"].get("log_every_steps", 10)))
     accumulation = int(config["training"].get("gradient_accumulation_steps", 1))
     precision = torch.bfloat16 if config["training"].get("precision", "bf16") == "bf16" else torch.float16
     global_step = 0
@@ -304,14 +332,26 @@ def train(config: dict) -> None:
                     metrics_stream.flush()
                 if rank == 0 and wandb_run is not None:
                     wandb_run.log(metric)
+                if rank == 0 and (
+                    global_step == 1 or global_step % log_every_steps == 0
+                ):
+                    print(
+                        f"stage=train epoch={epoch + 1}/{epochs} step={global_step} "
+                        f"loss={metric['loss']:.6f} visual_loss={metric['visual_loss']:.6f} "
+                        f"proprio_loss={metric['proprio_loss']:.6f}",
+                        flush=True,
+                    )
         if rank == 0:
             save_checkpoint(run_root / "last.pt", model=model, optimizer=optimizer, epoch=epoch + 1, config=config)
+            print(f"stage=checkpoint status=saved path={run_root / 'last.pt'}", flush=True)
         if max_steps and global_step >= max_steps:
             break
     if metrics_stream is not None:
         metrics_stream.close()
     if rank == 0 and wandb_run is not None:
         wandb_run.finish()
+    if rank == 0:
+        print(f"stage=train status=complete steps={global_step}", flush=True)
     _barrier()
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

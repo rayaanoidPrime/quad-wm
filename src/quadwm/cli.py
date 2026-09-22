@@ -156,16 +156,24 @@ def smoke(config: dict | None = None) -> None:
 
 
 def prepare(config: dict) -> None:
+    print("stage=prepare status=starting", flush=True)
     checkpoint = ensure_vjepa21_checkpoint(config.get("checkpoint_root", "checkpoints"))
     data_cfg = config.get("data", {})
     if data_cfg.get("download", False):
         data_root = data_cfg.get("data_root", config.get("data_root", "data/grandtour"))
+        print(
+            f"stage=data status=ensuring root={data_root} "
+            f"missions={data_cfg.get('missions', 'all')}",
+            flush=True,
+        )
         fetch_missions(
             data_cfg.get("missions"),
             data_root,
             data_cfg.get("download_topics"),
         )
-    print(f"checkpoint ready: {checkpoint}")
+        print("stage=data status=ready", flush=True)
+    print(f"stage=checkpoint status=ready path={checkpoint}", flush=True)
+    print("stage=prepare status=complete", flush=True)
 
 
 def main() -> None:

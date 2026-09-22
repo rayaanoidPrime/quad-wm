@@ -30,12 +30,17 @@ export QUADWM_CACHE_ROOT="${QUADWM_CACHE_ROOT:-$STORAGE_ROOT/cache/vjepa21-smoke
 mkdir -p logs "$GRANDTOUR_ROOT" "$QUADWM_CHECKPOINT_ROOT" "$QUADWM_CACHE_ROOT" "$RUN_ROOT"
 export QUADWM_GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
-echo "job=$SLURM_JOB_ID host=$(hostname)"
-echo "project=$PROJECT_DIR"
-echo "config=$CONFIG"
-echo "grandtour_root=$GRANDTOUR_ROOT"
-echo "run_root=$QUADWM_RUN_ROOT"
-echo "git_commit=$QUADWM_GIT_COMMIT"
+log() { echo "[$(date -Is)] $*"; }
 
+log "stage=job status=started id=$SLURM_JOB_ID host=$(hostname)"
+log "project=$PROJECT_DIR config=$CONFIG"
+log "grandtour_root=$GRANDTOUR_ROOT run_root=$QUADWM_RUN_ROOT"
+log "git_commit=$QUADWM_GIT_COMMIT"
+
+log "stage=prepare status=starting"
 uv run quadwm prepare --config "$CONFIG"
+log "stage=prepare status=complete"
+log "stage=train status=starting"
 uv run torchrun --standalone --nproc_per_node=1 -m quadwm train --config "$CONFIG"
+log "stage=train status=complete"
+log "stage=job status=complete"

@@ -34,10 +34,11 @@ training:
   learning_rate: 0.0005
   weight_decay: 0.0001
   clip_grad_norm: 1.0
+  log_every_steps: 1
   resume: ""
 
 wandb:
-  enabled: ${QUADWM_WANDB_ENABLED:-false}
+  enabled: ${QUADWM_WANDB_ENABLED:-true}
   project: quad-wm
   name: track1-baseline-jepa-smoke
-  mode: ${WANDB_MODE:-offline}
+  mode: ${WANDB_MODE:-online}

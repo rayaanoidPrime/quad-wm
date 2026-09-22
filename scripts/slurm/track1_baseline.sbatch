@@ -28,10 +28,18 @@ export QUADWM_RUN_ROOT="$RUN_ROOT"
 mkdir -p logs "$GRANDTOUR_ROOT" "$QUADWM_CHECKPOINT_ROOT" "$QUADWM_CACHE_ROOT" "$RUN_ROOT"
 export QUADWM_GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
-echo "job=$SLURM_JOB_ID host=$(hostname) gpus=${SLURM_GPUS_ON_NODE:-1} commit=$QUADWM_GIT_COMMIT"
-echo "config=$CONFIG grandtour_root=$GRANDTOUR_ROOT storage_root=$STORAGE_ROOT run_root=$RUN_ROOT"
-echo "missions=${GRANDTOUR_MISSIONS:-all materialized missions}"
+log() { echo "[$(date -Is)] $*"; }
+
+log "stage=job status=started id=$SLURM_JOB_ID host=$(hostname) gpus=${SLURM_GPUS_ON_NODE:-1}"
+log "config=$CONFIG grandtour_root=$GRANDTOUR_ROOT storage_root=$STORAGE_ROOT run_root=$RUN_ROOT"
+log "git_commit=$QUADWM_GIT_COMMIT"
+log "missions=${GRANDTOUR_MISSIONS:-all materialized missions}"
 
 GPUS="${SLURM_GPUS_ON_NODE:-1}"
+log "stage=prepare status=starting"
 uv run quadwm prepare --config "$CONFIG"
+log "stage=prepare status=complete"
+log "stage=train status=starting gpus=$GPUS"
 uv run torchrun --standalone --nproc_per_node="$GPUS" -m quadwm train --config "$CONFIG"
+log "stage=train status=complete"
+log "stage=job status=complete"
