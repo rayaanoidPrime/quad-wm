@@ -96,4 +96,5 @@ def build_model(
         context_steps=int(wm_config.get("context_steps", 7)),
         rollout_context=int(wm_config.get("rollout_context", 3)),
         encoder=visual_encoder,
+        with_toy_encoder=False,
     )
