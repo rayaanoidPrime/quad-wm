@@ -1,9 +1,9 @@
-name: track1-baseline-jepa
+name: jepa-baseline
 seed: 4551
 
 run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
 checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
-data_config: configs/data/grandtour_track1.yaml
+data_config: configs/data/jepa_baseline.yaml
 
 cache:
   mode: auto
@@ -43,6 +43,6 @@ training:
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}
-  project: quad-wm
-  name: track1-baseline-jepa
+  project: jepa-wm
+  name: jepa-baseline${SLURM_JOB_ID}
   mode: ${WANDB_MODE:-online}

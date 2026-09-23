@@ -1,4 +1,4 @@
-name: baseline-jepa-smoke
+name: jepa-baseline-smoke
 seed: 4551
 
 run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
@@ -39,6 +39,6 @@ training:
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}
-  project: quad-wm
-  name: track1-baseline-jepa-smoke
+  project: jepa-wm
+  name: jepa-baseline-smoke${SLURM_JOB_ID}
   mode: ${WANDB_MODE:-online}
