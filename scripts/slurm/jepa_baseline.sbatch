@@ -15,7 +15,7 @@ PROJECT_PARENT="$(dirname "$PROJECT_DIR")"
 STORAGE_ROOT="${QUADWM_STORAGE_ROOT:-$PROJECT_PARENT/quad-wm-storage}"
 # Stable run dir (not per-job-id) so checkpoints survive the walltime and the
 # next submission resumes from last.pt. Per-job stdout/stderr still use %j.
-RUN_ROOT="${RUN_ROOT:-${QUADWM_RUN_ROOT:-$STORAGE_ROOT/runs/track1-baseline}}"
+RUN_ROOT="${RUN_ROOT:-${QUADWM_RUN_ROOT:-$STORAGE_ROOT/runs/jepa-baseline}}"
 CONFIG="${CONFIG:-configs/jepa-wm/baseline.yaml}"
 
 module purge

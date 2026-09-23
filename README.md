@@ -65,7 +65,7 @@ streams encoder features without writing a cache.
 
 ```bash
 uv sync
-sbatch scripts/slurm/track1_baseline.sbatch
+sbatch scripts/slurm/jepa_baseline.sbatch
 ```
 
 Override the allocation or paths without editing the script:
@@ -73,7 +73,7 @@ Override the allocation or paths without editing the script:
 ```bash
 sbatch --gres=gpu:3 \
   --export=ALL,PROJECT_DIR="$PWD",CONFIG=configs/jepa-wm/baseline.yaml \
-  scripts/slurm/track1_baseline.sbatch
+  scripts/slurm/jepa_baseline.sbatch
 ```
 
 The encoder checkpoint and feature cache live under the configured external

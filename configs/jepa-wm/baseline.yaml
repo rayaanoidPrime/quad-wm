@@ -39,7 +39,7 @@ training:
   eval_every_steps: 200
   eval_max_batches: 8
   # Stable path so a job killed at the walltime resumes the next submission.
-  resume: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}/track1-baseline-jepa/last.pt
+  resume: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}/jepa-baseline/last.pt
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}
