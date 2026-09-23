@@ -26,8 +26,10 @@ model:
 
 training:
   epochs: 10
-  per_gpu_batch_size: 1
-  gradient_accumulation_steps: 8
+  # One GPU, batch 8 keeps the effective batch at 8 (was 1 x accum 8) while
+  # cutting micro-batches/epoch from 79,226 to 9,903. Peak VRAM ~80 GiB of 192.
+  per_gpu_batch_size: 8
+  gradient_accumulation_steps: 1
   num_workers: 0
   precision: bf16
   learning_rate: 0.0005
@@ -36,7 +38,8 @@ training:
   log_every_steps: 10
   eval_every_steps: 200
   eval_max_batches: 8
-  resume: ""
+  # Stable path so a job killed at the walltime resumes the next submission.
+  resume: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}/track1-baseline-jepa/last.pt
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}

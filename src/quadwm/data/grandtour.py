@@ -766,12 +766,12 @@ class GrandTourSequenceDataset(Dataset):
             valid &= (window_gap <= reader.max_gap_s).all(axis=(1, 2))
 
             dropped += int((~valid).sum())
+            kept = 0
             for row in ids[valid]:
                 self.index.append((reader_index, tuple(int(image_id) for image_id in row)))
-                if max_sequences is not None and len(self.index) >= max_sequences:
+                kept += 1
+                if max_sequences is not None and kept >= max_sequences:
                     break
-            if max_sequences is not None and len(self.index) >= max_sequences:
-                break
         total = dropped + len(self.index)
         self.stats = {
             "total": total,

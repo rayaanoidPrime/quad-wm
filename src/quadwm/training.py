@@ -114,7 +114,9 @@ def _build_token_cache(
         mission = reader.mission_dir.name
         image_ids = sorted({image_id for index in dataset.index if index[0] == reader_index for image_id in index[1]})
         if not image_ids:
-            raise ValueError(f"no cacheable images found for mission {mission}")
+            # A short or fully-invalid mission contributes no sequences, so there
+            # is nothing to cache (its reader is simply not used by the loader).
+            continue
         first = _prepare_images(
             torch.from_numpy(
                 np.stack([reader.load_image(i) for i in image_ids[:1]])
@@ -178,19 +180,34 @@ def _cache_fits(datasets, cache_root: Path, tokens: int, dim: int) -> bool:
     return required < free * 0.8
 
 
-def _batch_tokens(batch: dict, caches: list[TokenCache], device: torch.device) -> torch.Tensor:
+def _batch_tokens(batch: dict, caches: list[TokenCache | None], device: torch.device) -> torch.Tensor:
     mission_ids = batch["mission_idx"].tolist()
     image_ids = batch["image_ids"].numpy()
     rows = []
     for row, mission_id in enumerate(mission_ids):
-        rows.append(caches[mission_id].get(image_ids[row]))
+        cache = caches[mission_id]
+        if cache is None:
+            raise RuntimeError(f"no token cache for mission index {mission_id}")
+        rows.append(cache.get(image_ids[row]))
     return torch.from_numpy(np.stack(rows)).to(device, non_blocking=True)
+
+
+def _load_token_caches(cache_root: Path, readers, use_cache: bool) -> list[TokenCache | None]:
+    """Per-mission caches, aligned with reader order; None where nothing was cached."""
+    if not use_cache:
+        return []
+    return [
+        TokenCache(cache_root, reader.mission_dir.name)
+        if (cache_root / f"{reader.mission_dir.name}.json").is_file()
+        else None
+        for reader in readers
+    ]
 
 
 def _batch_visual_tokens(
     model: torch.nn.Module,
     batch: dict,
-    caches: list[TokenCache],
+    caches: list[TokenCache | None],
     device: torch.device,
     image_size: int,
     use_cache: bool,
@@ -208,7 +225,7 @@ def _batch_visual_tokens(
 def _evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
-    caches: list[TokenCache],
+    caches: list[TokenCache | None],
     device: torch.device,
     precision: torch.dtype,
     image_size: int,
@@ -380,16 +397,12 @@ def train(config: dict) -> None:
     if rank == 0:
         print(f"stage=feature_cache status={'enabled' if use_cache else 'disabled'}", flush=True)
     dataset.load_images = not use_cache
-    caches = [TokenCache(cache_root, reader.mission_dir.name) for reader in dataset.readers] if use_cache else []
+    caches = _load_token_caches(cache_root, dataset.readers, use_cache)
     eval_loader = None
-    eval_caches: list[TokenCache] = []
+    eval_caches: list[TokenCache | None] = []
     if eval_dataset is not None:
         eval_dataset.load_images = not use_cache
-        eval_caches = (
-            [TokenCache(cache_root, reader.mission_dir.name) for reader in eval_dataset.readers]
-            if use_cache
-            else []
-        )
+        eval_caches = _load_token_caches(cache_root, eval_dataset.readers, use_cache)
         eval_loader = eval_dataset.loader(
             batch_size=int(config["training"].get("per_gpu_batch_size", 1)),
             shuffle=False,
@@ -408,7 +421,15 @@ def train(config: dict) -> None:
         weight_decay=float(config["training"].get("weight_decay", 1e-4)),
     )
     resume = config["training"].get("resume")
-    start_epoch = load_checkpoint(resume, model=model, optimizer=optimizer) if resume else 0
+    resume_path = Path(resume) if resume else None
+    if resume_path is not None and resume_path.is_file():
+        start_epoch = load_checkpoint(resume_path, model=model, optimizer=optimizer)
+        if rank == 0:
+            print(f"stage=resume status=loaded path={resume_path} epoch={start_epoch}", flush=True)
+    else:
+        start_epoch = 0
+        if rank == 0 and resume_path is not None:
+            print(f"stage=resume status=fresh no_checkpoint={resume_path}", flush=True)
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
     loader = dataset.loader(
         batch_size=int(config["training"].get("per_gpu_batch_size", 1)),

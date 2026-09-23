@@ -190,6 +190,56 @@ def test_track1_dataset_synchronizes_to_depth_clock(tmp_path):
     np.testing.assert_allclose(dataset[0]["action"], np.arange(12))
 
 
+def _write_minimal_mission(mission, timestamps):
+    import zarr
+
+    root = zarr.open_group(store=mission / "data", mode="w")
+    camera = root.create_group("alphasense_front_center")
+    camera.create_array("timestamp", data=timestamps)
+    state = root.create_group("anymal_state_state_estimator")
+    state.create_array("timestamp", data=timestamps)
+    state.create_array("pose_pos", data=np.zeros((len(timestamps), 3)))
+    state.create_array("twist_lin", data=np.zeros((len(timestamps), 3)))
+    state.create_array("twist_ang", data=np.zeros((len(timestamps), 3)))
+    state.create_array("pose_orien", data=np.tile([0.0, 0.0, 0.0, 1.0], (len(timestamps), 1)))
+    state.create_array("joint_positions", data=np.zeros((len(timestamps), 12)))
+    state.create_array("joint_velocities", data=np.zeros((len(timestamps), 12)))
+    for foot in ("LF", "RF", "LH", "RH"):
+        state.create_array(f"{foot}_FOOT_contact", data=np.zeros(len(timestamps)))
+    actuator = root.create_group("anymal_state_actuator")
+    actuator.create_array("timestamp", data=timestamps)
+    for index in range(12):
+        actuator.create_array(f"{index:02d}_command_position", data=np.zeros(len(timestamps)))
+
+
+def test_sequence_max_sequences_applies_per_mission(tmp_path):
+    """A global cap would starve later eval missions and leave them uncacheable."""
+    pytest.importorskip("zarr")
+    from quadwm.data.grandtour import build_sequence_dataset
+
+    names = ["mission-a", "mission-b"]
+    for name in names:
+        _write_minimal_mission(tmp_path / name, np.array([0.0, 0.2]))
+
+    dataset = build_sequence_dataset(
+        {"missions": names},
+        observation="rgb_plus_proprioception",
+        platform="anymal_d",
+        data_root=tmp_path,
+        context_steps=1,
+        rollout_steps=1,
+        tick_hz=5.0,
+        control_hz=50.0,
+        action_frames=1,
+        max_sequences=1,
+        load_images=False,
+        missions=names,
+    )
+
+    assert len(dataset) == 2
+    assert sorted(reader_index for reader_index, _ in dataset.index) == [0, 1]
+
+
 def test_materialize_mission_extracts_topic_archive(tmp_path):
     mission = tmp_path / "mission-a"
     mission.mkdir()
