@@ -60,7 +60,11 @@ def init_wandb(
         init_kwargs["entity"] = entity
     tags = wandb_cfg.get("tags")
     if tags:
-        init_kwargs["tags"] = tags
+        init_kwargs["tags"] = [_jsonable(tag) for tag in tags]
+    for key in ("group", "job_type", "notes"):
+        value = wandb_cfg.get(key)
+        if value:
+            init_kwargs[key] = value
     if run_dir is not None:
         init_kwargs["dir"] = str(run_dir)
     settings_factory = getattr(wandb, "Settings", None)

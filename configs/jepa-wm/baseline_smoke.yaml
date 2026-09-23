@@ -40,5 +40,9 @@ training:
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}
   project: jepa-wm
-  name: jepa-baseline-smoke${SLURM_JOB_ID}
+  name: jepa-baseline-smoke-${SLURM_JOB_ID:-local}
+  group: jepa-baseline-smoke
+  job_type: smoke
+  tags:
+    - slurm-${SLURM_JOB_ID:-local}
   mode: ${WANDB_MODE:-online}

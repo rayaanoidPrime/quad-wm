@@ -44,5 +44,11 @@ training:
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}
   project: jepa-wm
-  name: jepa-baseline${SLURM_JOB_ID}
+  # job id in the run name so a dashboard run maps back to the Slurm job.
+  name: jepa-baseline-${SLURM_JOB_ID:-local}
+  group: jepa-baseline
+  job_type: train
+  tags:
+    - slurm-${SLURM_JOB_ID:-local}
+    - git-${QUADWM_GIT_COMMIT:-unknown}
   mode: ${WANDB_MODE:-online}
