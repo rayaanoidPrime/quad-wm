@@ -189,6 +189,14 @@ class Predictor(nn.Module):
         hidden = self.norm(values)
         visual = self.visual_head(hidden)
         proprio = self.proprio_head(hidden)
+
+        visual = F.layer_norm(
+            visual, (self.visual_dim,)
+        )
+
+        proprio = F.layer_norm(
+            proprio, (self.proprio_dim,)
+        )
         return torch.cat((visual, proprio), dim=-1).reshape(
             batch, frames, tokens, self.visual_dim + self.proprio_dim
         )[:, -1] # take the last frame [B, 576, 784]
@@ -211,6 +219,7 @@ class JEPAWorldModel(nn.Module):
     ):
         super().__init__()
         self.visual_dim = visual_dim
+        self.proprio_embed_dim = proprio_embed_dim
         self.model_dim = visual_dim + proprio_embed_dim
         self.tokens_per_frame = tokens_per_frame
         self.context_steps = context_steps
@@ -266,8 +275,18 @@ class JEPAWorldModel(nn.Module):
             predictor_context = context if step == 0 else context[:, -self.rollout_context :] # take all frames for step 0 then last rollout window from next steps
             prediction = self.predict_next(predictor_context, action) # [B, 576, 784]
             target = observations[:, context_steps + step].detach()
-            visual_loss = F.mse_loss(prediction[..., : self.visual_dim], target[..., : self.visual_dim])
-            proprio_loss = F.mse_loss(prediction[..., self.visual_dim :], target[..., self.visual_dim :])
+            target_visual = target[..., :self.visual_dim]
+            target_prop = target[..., self.visual_dim:]
+
+            target_visual = F.layer_norm(
+                target_visual, (self.visual_dim,)
+            )
+
+            target_prop = F.layer_norm(
+                target_prop, (self.proprio_embed_dim,)
+            )
+            visual_loss = F.mse_loss(prediction[..., : self.visual_dim], target_visual)
+            proprio_loss = F.mse_loss(prediction[..., self.visual_dim :], target_prop)
             step_loss = visual_loss + proprio_loss
             losses[f"loss_step_{step + 1}"] = step_loss
             rollout_losses.append(step_loss)
@@ -308,8 +327,26 @@ class JEPAWorldModel(nn.Module):
             prediction = self.predict_next(predictor_context, action)
             target = observations[:, context_steps + step]
             prefix = f"step_{step + 1}"
-            visual = F.mse_loss(prediction[..., : self.visual_dim], target[..., : self.visual_dim])
-            prop = F.mse_loss(prediction[..., self.visual_dim :], target[..., self.visual_dim :])
+            pred_visual = F.layer_norm(
+                prediction[..., :self.visual_dim],
+                (self.visual_dim,)
+            )
+            pred_prop = F.layer_norm(
+                prediction[..., self.visual_dim:],
+                (self.proprio_embed_dim,)
+            )
+
+            target_visual = F.layer_norm(
+                target[..., :self.visual_dim],
+                (self.visual_dim,)
+            )
+            target_prop = F.layer_norm(
+                target[..., self.visual_dim:],
+                (self.proprio_embed_dim,)
+            )
+
+            visual = F.mse_loss(pred_visual, target_visual)
+            prop = F.mse_loss(pred_prop, target_prop)
             metrics[f"{prefix}/visual_mse"] = float(visual)
             metrics[f"{prefix}/proprio_mse"] = float(prop)
             metrics[f"{prefix}/persistence_visual_mse"] = float(
