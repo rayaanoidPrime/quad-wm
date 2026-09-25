@@ -72,19 +72,7 @@ def build_model(
     *,
     visual_encoder: torch.nn.Module | None = None,
 ) -> JEPAWorldModel:
-    """Build either the small smoke model or the configured baseline model."""
-
-    baseline = bool(wm_config.get("baseline", False))
-    if not baseline:
-        return JEPAWorldModel(
-            visual_dim=int(wm_config.get("embed_dim", 128)),
-            tokens_per_frame=int(wm_config.get("tokens_per_frame", 1)),
-            predictor_depth=1,
-            predictor_heads=1,
-            context_steps=1,
-            rollout_context=1,
-            encoder=visual_encoder,
-        )
+    """Build the configured Track 1 baseline model."""
     return JEPAWorldModel(
         visual_dim=int(wm_config.get("visual_dim", 768)),
         proprio_dim=int(wm_config.get("proprio_dim", 33)),
@@ -96,5 +84,4 @@ def build_model(
         context_steps=int(wm_config.get("context_steps", 7)),
         rollout_context=int(wm_config.get("rollout_context", 3)),
         encoder=visual_encoder,
-        with_toy_encoder=False,
     )

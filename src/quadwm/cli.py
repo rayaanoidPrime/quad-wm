@@ -56,27 +56,9 @@ def smoke(config: dict | None = None) -> None:
     output_dir = Path(config.get("run_root", "runs")) / "smoke"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Keep the infrastructure smoke independent of GrandTour and GPUs.
+    # Fake metrics smoke if data / world model config is not given
     if "data" not in config or "wm" not in config:
-        metrics_path = output_dir / "metrics.jsonl"
-        run_metadata = _metadata(config)
-        wandb_run = init_wandb(config, metadata=run_metadata, run_dir=output_dir)
-        if wandb_run is not None:
-            run_metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
-            run_metadata["wandb_url"] = getattr(wandb_run, "url", None)
-        (output_dir / "run_metadata.json").write_text(
-            json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
-        )
-        with metrics_path.open("w", encoding="utf-8") as stream:
-            for step in range(1, steps + 1):
-                metric = {"step": step, "loss": 1.0 / step, "timestamp": time.time()}
-                stream.write(json.dumps(metric) + "\n")
-                if wandb_run is not None:
-                    wandb_run.log(metric)
-        if wandb_run is not None:
-            wandb_run.finish()
-        print(f"wrote {steps} metrics to {metrics_path}")
-        return
+        raise ValueError(f"Data or WM config not present at {config["config_path"]}")
 
     data_cfg = config["data"]
     wm_cfg = config["wm"]
@@ -155,6 +137,8 @@ def smoke(config: dict | None = None) -> None:
     print(f"wrote {steps} steps to {metrics_path}")
 
 
+# download encoder pretrained checkpoints,
+# fetch data
 def prepare(config: dict) -> None:
     print("stage=prepare status=starting", flush=True)
     checkpoint = ensure_vjepa21_checkpoint(config.get("checkpoint_root", "checkpoints"))

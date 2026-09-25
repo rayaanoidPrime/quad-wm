@@ -267,8 +267,10 @@ def train(config: dict) -> None:
     checkpoint_root = Path(config.get("checkpoint_root", "checkpoints"))
     data_cfg = config["data"]
     data_root = Path(data_cfg.get("data_root", config.get("data_root", "data/grandtour")))
-    model_cfg = {**config["model"], "baseline": True}
+
+    model_cfg = config["model"]
     if rank == 0:
+        # TODO fix redundancy between here and prepare()
         run_root.mkdir(parents=True, exist_ok=True)
         (run_root / "resolved_config.json").write_text(
             json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8"

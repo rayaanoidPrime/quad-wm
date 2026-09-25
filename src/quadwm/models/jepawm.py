@@ -208,7 +208,6 @@ class JEPAWorldModel(nn.Module):
         context_steps: int = 7,
         rollout_context: int = 3,
         encoder: nn.Module | None = None,
-        with_toy_encoder: bool = True,
     ):
         super().__init__()
         self.visual_dim = visual_dim
@@ -217,21 +216,6 @@ class JEPAWorldModel(nn.Module):
         self.context_steps = context_steps
         self.rollout_context = rollout_context
         self.visual_encoder = encoder
-        # Only the depth-smoke path uses the toy encoder; registering it on the
-        # baseline leaves unused parameters that break DDP reduction.
-        self.toy_encoder = (
-            nn.Sequential(
-                nn.Conv2d(1, 16, kernel_size=5, stride=4),
-                nn.GELU(),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2),
-                nn.GELU(),
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(32, visual_dim * tokens_per_frame),
-            )
-            if with_toy_encoder
-            else None
-        )
         self.proprio_encoder = ProprioEncoder(proprio_dim, proprio_embed_dim)
         self.action_encoder = ActionEncoder(action_dim, self.model_dim)
         self.predictor = Predictor(
@@ -342,13 +326,6 @@ class JEPAWorldModel(nn.Module):
         return metrics
 
     def training_step(self, batch: dict[str, Tensor], _: float = 0.0) -> dict[str, Tensor]:
-        if "depth_t" in batch:
-            if self.toy_encoder is None:
-                raise RuntimeError("toy encoder is not enabled for this model")
-            prediction = self.toy_encoder(batch["depth_t"].float())
-            target = self.toy_encoder(batch["depth_t1"].float()).detach()
-            loss = F.mse_loss(prediction, target)
-            return {"loss": loss, "visual_loss": loss, "proprio_loss": loss.detach() * 0}
         if "visual_tokens" in batch:
             visual_tokens = batch["visual_tokens"]
         else:
@@ -360,6 +337,3 @@ class JEPAWorldModel(nn.Module):
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         return self.training_step(batch)
-
-
-JepaWM = JEPAWorldModel

@@ -11,7 +11,6 @@ cache:
   batch_size: 16
 
 model:
-  baseline: true
   image_size: 384
   visual_dim: 768
   tokens_per_frame: 576

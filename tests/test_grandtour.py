@@ -140,56 +140,6 @@ def test_inspect_root_is_mission_level(tmp_path):
     assert {item["mission"] for item in report["missions"]} == {"mission-a", "mission-b"}
 
 
-def test_track1_dataset_synchronizes_to_depth_clock(tmp_path):
-    zarr = pytest.importorskip("zarr")
-    from quadwm.data.grandtour import Track1MissionDataset
-
-    mission = tmp_path / "mission-a"
-    data = zarr.open_group(store=mission / "data", mode="w")
-    images = mission / "images" / "depth_camera_front_upper"
-    images.mkdir(parents=True)
-    for sequence_id in range(3):
-        (images / f"{sequence_id:06d}.png").write_bytes(b"not-a-real-image")
-
-    def array(group, name, values):
-        group.create_array(name, data=np.asarray(values), overwrite=True)
-
-    depth = data.create_group("depth_camera_front_upper")
-    array(depth, "timestamp", [0.0, 0.1, 0.2])
-    array(depth, "sequence_id", [0, 1, 2])
-
-    state = data.create_group("anymal_state_state_estimator")
-    array(state, "timestamp", [0.0, 0.1, 0.2])
-    array(state, "pose_pos", np.zeros((3, 3)))
-    array(state, "twist_lin", np.ones((3, 3)))
-    array(state, "twist_ang", np.ones((3, 3)))
-    array(state, "pose_orien", np.tile([0.0, 0.0, 0.0, 1.0], (3, 1)))
-    array(state, "joint_positions", np.zeros((3, 12)))
-    array(state, "joint_velocities", np.zeros((3, 12)))
-    for foot in ("LF", "RF", "LH", "RH"):
-        array(state, f"{foot}_FOOT_contact", [1, 0, 1])
-
-    actuator = data.create_group("anymal_state_actuator")
-    array(actuator, "timestamp", [0.0, 0.1, 0.2])
-    for index in range(12):
-        array(actuator, f"{index:02d}_command_position", np.full(3, index))
-
-    dataset = Track1MissionDataset(mission)
-
-    assert len(dataset) == 3
-    assert dataset.dimensions == {
-        "proprio": 33,
-        "proprio_history": 1,
-        "state": 40,
-        "action": 12,
-    }
-    assert dataset[0]["proprio"].shape == (33,)
-    assert dataset[0]["proprio_history"].shape == (1, 33)
-    assert dataset[0]["state"].shape == (40,)
-    assert dataset[0]["action"].shape == (12,)
-    np.testing.assert_allclose(dataset[0]["action"], np.arange(12))
-
-
 def _write_minimal_mission(mission, timestamps):
     import zarr
 
