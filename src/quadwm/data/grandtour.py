@@ -27,7 +27,6 @@ instances of this class, not built here.
 
 from __future__ import annotations
 
-import bisect
 import fnmatch
 import random
 import re
@@ -104,17 +103,14 @@ def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | N
         return re.compile("|".join(parts))
 
     pattern = to_regex(allow_patterns) if allow_patterns else None
-    files = [
-        f for f in Path(cache_dir).rglob("*")
-        if f.is_file() and (pattern is None or pattern.match(f.as_posix()))
-    ]
-
-    def is_tar(path: Path) -> bool:
-        return path.name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2"))
-
-    for f in [x for x in files if is_tar(x)]:
+    for f in Path(cache_dir).rglob("*"):
+        if not f.is_file() or (pattern is not None and not pattern.match(f.as_posix())):
+            continue
         dest = dest_dir / f.relative_to(cache_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if not f.name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")):
+            shutil.copy2(f, dest)
+            continue
         with tarfile.open(f, "r:*") as tar:
             members = tar.getmembers()
             relative_archive = f.relative_to(cache_dir)
@@ -138,11 +134,6 @@ def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | N
             else:
                 extract_root = dest.parent
             tar.extractall(path=extract_root)
-
-    for f in [x for x in files if not is_tar(x) and x.is_file()]:
-        dest = dest_dir / f.relative_to(cache_dir)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, dest)
 
 
 def _mission_names(missions: list[str] | str | None) -> list[str]:
@@ -466,30 +457,33 @@ class MissionReader:
     def __len__(self) -> int:
         return len(self.depth_timestamps)
 
+    def _image_path(self, image_id: int) -> Path:
+        """Resolve the on-disk image file for a Zarr array position.
+
+        ``image_id`` is the zero-based array position -- NOT
+        ``depth_group["sequence_id"][image_id]``, which is the ROS-runtime id
+        and does not index the file on disk.  A topic may be stored as PNG or
+        JPEG, so try its configured extension first, then fall back.
+        """
+        for suffix in (self._image_ext, ".png", ".jpeg", ".jpg"):
+            path = self._image_dir / f"{image_id:06d}{suffix}"
+            if path.exists():
+                return path
+        raise FileNotFoundError(f"no image for {self.depth_topic}[{image_id}] in {self._image_dir}")
+
     def load_depth(self, image_id: int) -> np.ndarray:
-        # image_id is the zero-based array position -- NOT
-        # depth_group["sequence_id"][image_id], which is the ROS-runtime id
-        # and does not index the file on disk.
-        path = self._image_dir / f"{image_id:06d}{self._image_ext}"
-        depth_mm = imageio.imread(path).astype(np.float32)
+        depth_mm = imageio.imread(self._image_path(image_id)).astype(np.float32)
         return depth_mm / 1000.0  # mm -> m
 
     def load_image(self, image_id: int) -> np.ndarray:
         """Load the image at the Zarr array position, not its runtime id."""
-        for suffix in (".jpeg", ".jpg", ".png"):
-            path = self._image_dir / f"{image_id:06d}{suffix}"
-            if path.exists():
-                return imageio.imread(path)
-        raise FileNotFoundError(f"no image for {self.depth_topic}[{image_id}] in {self._image_dir}")
+        return imageio.imread(self._image_path(image_id))
 
     @staticmethod
     def _nearest(timestamps: np.ndarray, t: float) -> tuple[int, float]:
         """Index of the timestamp closest to ``t`` (ties go to the earlier one)."""
-        after = min(max(bisect.bisect_left(timestamps, t), 0), len(timestamps) - 1)
-        before = max(after - 1, 0)
-        if abs(float(timestamps[before]) - t) <= abs(float(timestamps[after]) - t):
-            return before, abs(float(timestamps[before]) - t)
-        return after, abs(float(timestamps[after]) - t)
+        index, gap = _nearest_indices(timestamps, np.asarray([t]))
+        return int(index[0]), float(gap[0])
 
     def sample_state(self, t: float) -> dict | None:
         p_idx, p_gap = self._nearest(self.proprio_timestamps, t)

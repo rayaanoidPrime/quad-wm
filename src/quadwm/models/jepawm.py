@@ -84,22 +84,13 @@ class VJEPA21Encoder(nn.Module):
         return _tokens(self.encoder(images.unsqueeze(2)))
 
 
-class ProprioEncoder(nn.Module):
+class EncoderProjection(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.net = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, output_dim))
 
-    def forward(self, proprio: Tensor) -> Tensor:
-        return self.net(proprio)
-
-
-class ActionEncoder(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, output_dim))
-
-    def forward(self, action: Tensor) -> Tensor:
-        return self.net(action)
+    def forward(self, values: Tensor) -> Tensor:
+        return self.net(values)
 
 
 class RotaryAttention(nn.Module):
@@ -216,8 +207,8 @@ class JEPAWorldModel(nn.Module):
         self.context_steps = context_steps
         self.rollout_context = rollout_context
         self.visual_encoder = encoder
-        self.proprio_encoder = ProprioEncoder(proprio_dim, proprio_embed_dim)
-        self.action_encoder = ActionEncoder(action_dim, self.model_dim)
+        self.proprio_encoder = EncoderProjection(proprio_dim, proprio_embed_dim)
+        self.action_encoder = EncoderProjection(action_dim, self.model_dim)
         self.predictor = Predictor(
             self.model_dim,
             predictor_heads,

@@ -29,7 +29,7 @@ from .models import (
     load_checkpoint,
     save_checkpoint,
 )
-from .utils import init_wandb
+from .utils import init_wandb, run_metadata
 
 
 def _distributed() -> tuple[int, int, int, torch.device]:
@@ -99,6 +99,18 @@ def _cache_valid(root: Path, mission: str, image_ids: list[int], shape: tuple[in
     return metadata["image_ids"] == image_ids and tuple(metadata["shape"]) == shape
 
 
+def _mission_image_ids(dataset, reader_index: int) -> list[int]:
+    """Sorted unique image ids the reader contributes to the dataset's sequences."""
+    return sorted(
+        {
+            image_id
+            for index in dataset.index
+            if index[0] == reader_index
+            for image_id in index[1]
+        }
+    )
+
+
 @torch.no_grad()
 def _build_token_cache(
     dataset,
@@ -112,7 +124,7 @@ def _build_token_cache(
     encoder.eval().to(device)
     for reader_index, reader in enumerate(dataset.readers):
         mission = reader.mission_dir.name
-        image_ids = sorted({image_id for index in dataset.index if index[0] == reader_index for image_id in index[1]})
+        image_ids = _mission_image_ids(dataset, reader_index)
         if not image_ids:
             # A short or fully-invalid mission contributes no sequences, so there
             # is nothing to cache (its reader is simply not used by the loader).
@@ -170,7 +182,7 @@ def _build_token_cache(
 
 def _cache_fits(datasets, cache_root: Path, tokens: int, dim: int) -> bool:
     ids = sum(
-        len({image_id for index in dataset.index if index[0] == reader_index for image_id in index[1]})
+        len(_mission_image_ids(dataset, reader_index))
         for dataset in datasets
         for reader_index in range(len(dataset.readers))
     )
@@ -438,13 +450,9 @@ def train(config: dict) -> None:
         num_workers=int(config["training"].get("num_workers", 0)),
         sampler=sampler,
     )
-    metadata = {
-        "host": os.uname().nodename,
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID", "local"),
-        "git_commit": os.environ.get("QUADWM_GIT_COMMIT", "unknown"),
+    metadata = run_metadata(config) | {
         "rank": rank,
         "world_size": world_size,
-        "visible_devices": os.environ.get("ROCR_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "all")),
         "gpu_name": torch.cuda.get_device_name(device),
     }
     wandb_run = init_wandb(config, metadata=metadata, run_dir=run_root) if rank == 0 else None

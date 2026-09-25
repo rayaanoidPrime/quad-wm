@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import platform
-import socket
-import sys
 import time
 from pathlib import Path
 
@@ -16,24 +12,10 @@ import torch
 from quadwm.data import build_dataset, fetch_missions, verify_joint_order_consistency
 from quadwm.models import build_model, ensure_vjepa21_checkpoint
 from quadwm.training import train as train_world_model
-from quadwm.utils import init_wandb
+from quadwm.utils import init_wandb, run_metadata
 
 from .config import load_config
 
-
-def _metadata(config: dict | None = None) -> dict[str, str]:
-    config = config or {}
-    return {
-        "python": sys.version.split()[0],
-        "host": socket.gethostname(),
-        "platform": platform.platform(),
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID", "local"),
-        "config_path": config.get("config_path", "unknown"),
-        "git_commit": os.environ.get("QUADWM_GIT_COMMIT", "unknown"),
-        "visible_devices": os.environ.get(
-            "ROCR_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "all")
-        ),
-    }
 
 # should this just be a test? TODO
 def _check_batch(batch: dict) -> None:
@@ -103,14 +85,14 @@ def smoke(config: dict | None = None) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.get("lr", 3e-4)))
 
     metrics_path = output_dir / "metrics.jsonl"
-    run_metadata = _metadata(config)
-    wandb_run = init_wandb(config, metadata=run_metadata, run_dir=output_dir)
+    metadata = run_metadata(config)
+    wandb_run = init_wandb(config, metadata=metadata, run_dir=output_dir)
     if wandb_run is not None:
-        run_metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
-        run_metadata["wandb_url"] = getattr(wandb_run, "url", None)
+        metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
+        metadata["wandb_url"] = getattr(wandb_run, "url", None)
 
     (output_dir / "run_metadata.json").write_text(
-        json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
 
     with metrics_path.open("w", encoding="utf-8") as stream:
