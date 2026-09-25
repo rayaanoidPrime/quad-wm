@@ -145,12 +145,27 @@ class AdaLNBlock(nn.Module):
 
 
 class Predictor(nn.Module):
-    def __init__(self, dim: int, heads: int, depth: int, local_window_time: int, tokens_per_frame: int):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        depth: int,
+        local_window_time: int,
+        tokens_per_frame: int,
+        visual_dim: int,
+        proprio_dim: int,
+    ):
         super().__init__()
         self.local_window_time = local_window_time
         self.tokens_per_frame = tokens_per_frame
+        self.visual_dim = visual_dim
+        self.proprio_dim = proprio_dim
         self.blocks = nn.ModuleList(AdaLNBlock(dim, heads) for _ in range(depth))
         self.norm = nn.LayerNorm(dim)
+        # Separate heads so the P proprio dims are not forced to share one
+        # LayerNorm with the D visual dims.
+        self.visual_head = nn.Linear(dim, visual_dim)
+        self.proprio_head = nn.Linear(dim, proprio_dim)
 
     def _mask(self, frames: int, device: torch.device) -> Tensor:
         length = frames * self.tokens_per_frame
@@ -171,7 +186,12 @@ class Predictor(nn.Module):
         mask = self._mask(frames, values.device)
         for block in self.blocks:
             values = block(values, condition, mask)
-        return self.norm(values).reshape(batch, frames, tokens, dim)[:, -1] # take the last frame [B, 576, 784]
+        hidden = self.norm(values)
+        visual = self.visual_head(hidden)
+        proprio = self.proprio_head(hidden)
+        return torch.cat((visual, proprio), dim=-1).reshape(
+            batch, frames, tokens, self.visual_dim + self.proprio_dim
+        )[:, -1] # take the last frame [B, 576, 784]
 
 
 class JEPAWorldModel(nn.Module):
@@ -204,6 +224,8 @@ class JEPAWorldModel(nn.Module):
             predictor_depth,
             rollout_context,
             tokens_per_frame,
+            visual_dim,
+            proprio_embed_dim,
         )
 
     def encode_visual(self, images: Tensor) -> Tensor:
@@ -212,7 +234,11 @@ class JEPAWorldModel(nn.Module):
         return self.visual_encoder(images)
 
     def encode_observation(self, visual: Tensor, proprio: Tensor) -> Tensor:
-        prop = self.proprio_encoder(proprio).unsqueeze(-2) # [B,T,1,16]
+        prop = self.proprio_encoder(proprio) # [B,T,16]
+        # Pin the proprio embedding to unit variance (no affine -> no learnable
+        # params) so E_prop cannot drift its output scale; otherwise every raw
+        # proprio MSE is a moving yardstick and the loss is scale-dominated.
+        prop = F.layer_norm(prop, (prop.shape[-1],)).unsqueeze(-2) # [B,T,1,16]
         prop = prop.expand(*prop.shape[:-2], visual.shape[-2], prop.shape[-1]) # [B,T,576,16]
         return torch.cat((visual, prop), dim=-1) # [B, T, 576, 784]
 
