@@ -17,18 +17,31 @@ VJEPA21_URL = f"https://dl.fbaipublicfiles.com/vjepa2/{VJEPA21_FILENAME}"
 def ensure_vjepa21_checkpoint(checkpoint_root: str | Path) -> Path:
     """Download the official checkpoint once, atomically, to local storage."""
 
-    root = Path(checkpoint_root)
-    root.mkdir(parents=True, exist_ok=True)
-    checkpoint = root / VJEPA21_FILENAME
+    root = Path(checkpoint_root) # STORAGE_ROOT/checkpoints
+    checkpoint = root / "hub" / "checkpoints" / VJEPA21_FILENAME
+
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+
     if checkpoint.is_file() and checkpoint.stat().st_size > 0:
         return checkpoint
-    with tempfile.NamedTemporaryFile(dir=root, suffix=".part", delete=False) as handle:
+
+    with tempfile.NamedTemporaryFile(
+        dir=checkpoint.parent,
+        suffix=".part",
+        delete=False,
+    ) as handle:
         temporary = Path(handle.name)
+
     try:
-        torch.hub.download_url_to_file(VJEPA21_URL, str(temporary), progress=True)
+        torch.hub.download_url_to_file(
+            VJEPA21_URL,
+            str(temporary),
+            progress=True,
+        )
         os.replace(temporary, checkpoint)
     finally:
         temporary.unlink(missing_ok=True)
+
     return checkpoint
 
 

@@ -295,6 +295,34 @@ def _check_dataset(
             )
 
 
+def prepare(config: dict) -> Path:
+    """Materialize configured GrandTour data and the V-JEPA 2.1 checkpoint.
+
+    Idempotent, so it is safe to run interactively via ``quadwm prepare`` and
+    again from ``train`` on the same job.
+    """
+    print("stage=prepare status=starting", flush=True)
+    checkpoint_root = Path(config.get("checkpoint_root", "checkpoints")) # STORAGE_ROOT/checkpoints
+    data_cfg = config.get("data", {})
+    if data_cfg.get("download", True):
+        data_root = Path(data_cfg.get("data_root", config.get("data_root", "data/grandtour")))
+        print(
+            f"stage=data status=ensuring root={data_root} "
+            f"missions={data_cfg.get('missions', 'all')}",
+            flush=True,
+        )
+        fetch_missions(
+            data_cfg.get("missions"),
+            data_root,
+            data_cfg.get("download_topics"),
+        )
+        print("stage=data status=ready", flush=True)
+    checkpoint = ensure_vjepa21_checkpoint(checkpoint_root)
+    print(f"stage=checkpoint status=ready path={checkpoint}", flush=True)
+    print("stage=prepare status=complete", flush=True)
+    return checkpoint
+
+
 def train(config: dict) -> None:
     rank, world_size, local_rank, device = _distributed()
     _seed(int(config.get("seed", 4551)), rank)
@@ -311,20 +339,11 @@ def train(config: dict) -> None:
 
     model_cfg = config["model"]
     if rank == 0:
-        # TODO fix redundancy between here and prepare()
         run_root.mkdir(parents=True, exist_ok=True)
         (run_root / "resolved_config.json").write_text(
             json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8"
         )
-        if data_cfg.get("download", True):
-            print("stage=data status=checking", flush=True)
-            fetch_missions(
-                data_cfg.get("missions"),
-                data_root,
-                data_cfg.get("download_topics"),
-            )
-            print("stage=data status=ready", flush=True)
-        ensure_vjepa21_checkpoint(checkpoint_root)
+        prepare(config)
     _barrier()
 
     eval_fraction = float(data_cfg.get("eval_fraction", 0.0))

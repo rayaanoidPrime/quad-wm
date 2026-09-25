@@ -31,7 +31,7 @@ class VJEPA21Encoder(nn.Module):
 
     def __init__(self, checkpoint_root: str | Path):
         super().__init__()
-        checkpoint_root = Path(checkpoint_root)
+        checkpoint_root = Path(checkpoint_root) # STORAGE_ROOT/checkpoints
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         # Point torch.hub at our storage *before* resolving its cache dir, then
         # seed the file where torch.hub.load_state_dict_from_url actually looks
@@ -39,25 +39,14 @@ class VJEPA21Encoder(nn.Module):
         # path makes the official hub entry re-download (or, since upstream
         # vjepa2 main points VJEPA_BASE_URL at localhost, fail with a 404).
         os.environ["TORCH_HOME"] = str(checkpoint_root)
-        torch_checkpoint = Path(torch.hub.get_dir()) / "checkpoints"
-        torch_checkpoint.mkdir(parents=True, exist_ok=True)
-        local_checkpoint = checkpoint_root / VJEPA21_FILENAME
+        torch_checkpoint = Path(torch.hub.get_dir()) / "checkpoints" # STORAGE_ROOT/checkpoints/hub/checkpoints
+        torch_checkpoint.mkdir(parents=True, exist_ok=True) 
+        local_checkpoint = torch_checkpoint / VJEPA21_FILENAME # STORAGE_ROOT/checkpoints/file
         if not local_checkpoint.is_file():
             raise FileNotFoundError(
                 f"V-JEPA 2.1 checkpoint not found at {local_checkpoint}; "
                 "run `quadwm prepare` first"
             )
-        cached_checkpoint = torch_checkpoint / local_checkpoint.name
-        if not cached_checkpoint.exists():
-            # Unique temp + atomic replace so concurrent ranks can't race.
-            temporary = cached_checkpoint.with_name(
-                f"{cached_checkpoint.name}.{os.getpid()}.part"
-            )
-            try:
-                os.link(local_checkpoint, temporary)
-            except OSError:
-                shutil.copy2(local_checkpoint, temporary)
-            os.replace(temporary, cached_checkpoint)
         loaded = torch.hub.load(
             "facebookresearch/vjepa2",
             "vjepa2_1_vit_base_384",
