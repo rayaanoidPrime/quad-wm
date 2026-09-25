@@ -1,12 +1,8 @@
-"""GrandTour dataset interface for quadwm: idempotent download + synced pairs.
+"""GrandTour dataset interface for quadwm: idempotent download + synced sequences.
 
-Usage (see cli.py):
+Usage (see training.py):
     fetch_missions(config["data"]["missions"], config["data_root"])
-    dataset = build_dataset(
-        config["data"], observation=config["wm"]["observation"],
-        platform=config["wm"]["platform"], data_root=config["data_root"],
-        horizon=config["wm"].get("horizon_steps", 4),
-    )
+    dataset = build_sequence_dataset(...)
     loader = dataset.loader(batch_size=8)
 
 Known gotchas encoded here (see grandtour_data_guide.md for detail):
@@ -18,11 +14,6 @@ Known gotchas encoded here (see grandtour_data_guide.md for detail):
     dataset. anymal_state_state_estimator's joint_positions/joint_velocities
     ordering is NOT independently documented -- verify_joint_order_consistency()
     checks it empirically; call it once per mission before trusting either.
-
-Scope note: GrandTourPairDataset uses a single fixed prediction horizon.
-The Track 1 recipe's multi-horizon set H_g = {1, 4, 12} for the transition
-grounding loss is a straightforward loop over several horizon-configured
-instances of this class, not built here.
 """
 
 from __future__ import annotations
@@ -535,73 +526,6 @@ class MissionReader:
 # Datasets
 # --------------------------------------------------------------------------
 
-class GrandTourPairDataset(Dataset):
-    """(t, t+horizon) pairs within a single mission, for JEPA forward
-    prediction and the PSG-JEPA transition-grounding head.
-
-    Pairing happens at the raw image_id level within a mission (not the
-    drop-filtered index), so both endpoints get their own independent sync
-    check -- and the actual elapsed time between them is checked against the
-    expected horizon duration, since a dropped frame in between would
-    otherwise silently produce a pair that spans more real time than intended.
-    """
-
-    def __init__(
-        self, readers: list[MissionReader], horizon: int, rate_hz: float, rate_tol: float = 0.3
-    ):
-        self.readers = readers
-        self.horizon = horizon
-        expected_dt = horizon / rate_hz
-        self.index: list[tuple[int, int]] = []
-        dropped = 0
-        for r_idx, reader in enumerate(readers):
-            n = len(reader)
-            for i in range(n - horizon):
-                t0 = float(reader.depth_timestamps[i])
-                t1 = float(reader.depth_timestamps[i + horizon])
-                if abs((t1 - t0) - expected_dt) > rate_tol * expected_dt:
-                    dropped += 1
-                    continue
-                if reader.sample_state(t0) is None or reader.sample_state(t1) is None:
-                    dropped += 1
-                    continue
-                self.index.append((r_idx, i))
-        total = dropped + len(self.index)
-        self.stats = {
-            "total": total, "kept": len(self.index), "dropped": dropped,
-            "drop_rate": dropped / total if total else 0.0,
-        }
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, idx: int) -> dict:
-        r_idx, i = self.index[idx]
-        reader = self.readers[r_idx]
-        s0 = reader[i]
-        s1 = reader[i + self.horizon]
-        out = {
-            "depth_t": torch.from_numpy(s0["depth"]).unsqueeze(0),
-            "depth_t1": torch.from_numpy(s1["depth"]).unsqueeze(0),
-            "action_t": torch.from_numpy(s0["action"]),
-        }
-        for suffix, s in (("_t", s0), ("_t1", s1)):
-            out[f"pose_pos{suffix}"] = torch.from_numpy(s["pose_pos"])
-            out[f"joint_pos{suffix}"] = torch.from_numpy(s["joint_pos"])
-            out[f"joint_vel{suffix}"] = torch.from_numpy(s["joint_vel"])
-            out[f"lin_vel{suffix}"] = torch.from_numpy(s["lin_vel"])
-            out[f"ang_vel{suffix}"] = torch.from_numpy(s["ang_vel"])
-            out[f"gravity{suffix}"] = torch.from_numpy(s["gravity"])
-            out[f"contacts{suffix}"] = torch.from_numpy(s["contacts"])
-        return out
-
-    def loader(self, batch_size: int, shuffle: bool = False, num_workers: int = 0) -> DataLoader:
-        # num_workers > 0 pickles open zarr groups across worker processes,
-        # which is fragile -- keep at 0 for the smoke test; revisit with a
-        # worker_init_fn that reopens the store per-worker for full runs.
-        return DataLoader(self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-
-
 class GrandTourSequenceDataset(Dataset):
     """Fixed-length RGB/proprio/action windows for JEPA-WM training."""
 
@@ -733,30 +657,6 @@ class GrandTourSequenceDataset(Dataset):
             pin_memory=True,
             drop_last=True,
         )
-
-
-def build_dataset(
-    data_config: dict,
-    observation: str,
-    platform: str,
-    data_root: str | Path,
-    horizon: int = 4,
-) -> GrandTourPairDataset:
-    topics = resolve_topics(observation, platform)
-    max_gap_s = data_config.get("max_gap_ms", 50) / 1000.0
-    rate_hz = data_config.get("sync_rate_hz", 15.0)
-    _, mission_dirs = _mission_dirs(data_root, data_config.get("missions"))
-    readers = [
-        MissionReader(
-            mission_dir,
-            depth_topic=topics["depth"],
-            proprio_topic=topics["proprio"],
-            actuator_topic=topics["actuator"],
-            max_gap_s=max_gap_s,
-        )
-        for mission_dir in mission_dirs
-    ]
-    return GrandTourPairDataset(readers, horizon=horizon, rate_hz=rate_hz)
 
 
 def build_sequence_dataset(

@@ -316,7 +316,7 @@ class JEPAWorldModel(nn.Module):
         )
         return metrics
 
-    def training_step(self, batch: dict[str, Tensor], _: float = 0.0) -> dict[str, Tensor]:
+    def training_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if "visual_tokens" in batch:
             visual_tokens = batch["visual_tokens"]
         else:

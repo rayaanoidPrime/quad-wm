@@ -3,7 +3,7 @@ seed: 4551
 
 run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
 checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
-data_config: configs/data/jepa_baseline.yaml
+data_config: configs/data/baseline.yaml
 
 cache:
   mode: auto

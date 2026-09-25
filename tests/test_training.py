@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -46,6 +48,21 @@ def test_token_cache_feeds_chw_images_to_encoder(tmp_path):
 
     metadata = (tmp_path / "mission-a.json").read_text(encoding="utf-8")
     assert '"shape": [3, 4, 8]' in metadata
+
+
+def test_cache_valid_accepts_superset_of_ids(tmp_path):
+    from quadwm.training import _cache_valid
+
+    (tmp_path / "mission-a.mmap").write_bytes(b"")
+    (tmp_path / "mission-a.json").write_text(
+        json.dumps({"image_ids": [1, 2, 3], "shape": [3, 4, 8]}), encoding="utf-8"
+    )
+
+    # A subset of the cached ids reuses the cache instead of clobbering it.
+    assert _cache_valid(tmp_path, "mission-a", [2, 3], (2, 4, 8))
+    # Missing id or mismatched token dims must not reuse.
+    assert not _cache_valid(tmp_path, "mission-a", [2, 9], (2, 4, 8))
+    assert not _cache_valid(tmp_path, "mission-a", [2, 3], (2, 5, 8))
 
 
 def test_token_cache_removes_partial_files_on_failure(tmp_path):

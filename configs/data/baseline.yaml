@@ -13,6 +13,7 @@ tick_hz: 5
 control_hz: 50
 action_frames: 10
 max_gap_ms: 50
+max_drop_rate: 0.3
 sync_rate_hz: 10
 calibration: per_mission
 

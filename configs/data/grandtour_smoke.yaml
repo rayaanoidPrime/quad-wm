@@ -11,6 +11,9 @@ tick_hz: 5
 control_hz: 50
 action_frames: 10
 max_sequences: 8
+eval_missions: ["2024-11-02-17-18-32"]  # same mission: smoke covers the eval code path cheaply
+eval_max_sequences: 2
+max_drop_rate: 0.3        # fail fast if the depth/state/action sync degrades
 sync_rate_hz: 10          # camera rate, the base clock
 max_gap_ms: 50
 calibration: per_mission  # reload K/D/transform per mission, never cache

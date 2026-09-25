@@ -4,7 +4,7 @@ Collaborative infrastructure for quadruped world-model experiments, starting wit
 
 ## Current status
 
-This repository is at the infrastructure-and-data-contract stage. It contains a CPU-only smoke runner, a Slurm entry point, W&B integration hooks, collaboration rules, the research recipes, and a deterministic GrandTour Track 1 consumer. Simulator and ANYmal-D assets are intentionally not installed yet; MuJoCo is the first simulator candidate and Isaac Lab is optional.
+This repository is at the infrastructure-and-data-contract stage. It contains an end-to-end smoke runner, a Slurm entry point, W&B integration hooks, collaboration rules, the research recipes, and a deterministic GrandTour Track 1 consumer. Simulator and ANYmal-D assets are intentionally not installed yet; MuJoCo is the first simulator candidate and Isaac Lab is optional.
 
 The first simulator gate is a headless MuJoCo physics/rendering smoke test on the target node. The code keeps simulation behind an adapter so the same training/evaluation infrastructure can later consume MuJoCo, Isaac Lab, or another simulator without rewriting the JEPA stack.
 
@@ -24,20 +24,20 @@ The first simulator gate is a headless MuJoCo physics/rendering smoke test on th
 
 ## First smoke test
 
-The smoke test has no PyTorch or simulator dependency. It validates run directories, resolved metadata, deterministic synthetic loss generation, and optional W&B logging.
+`quadwm smoke` runs the *entire* pipeline on the tiny smoke config -- download, data sync, token cache, V-JEPA encoder, one training step, checkpoint save, and a held-out eval pass. It is the same `train` code path, so configuration, data, and eval errors surface before a full training run. It needs an allocated GPU and materialized GrandTour data; the CPU-only check is the unit-test suite.
 
 ```bash
-uv run quadwm smoke --config configs/jepa-wm/smoke.yaml
-uv run pytest -q
+uv run quadwm smoke            # == quadwm train --config configs/jepa-wm/baseline_smoke.yaml
+uv run pytest -q               # CPU-only unit tests
 ```
 
-For Slurm, edit the project and virtual-environment paths in `scripts/slurm/track1_smoke.sbatch` or export them before submission:
+For Slurm, edit the project and virtual-environment paths in `scripts/slurm/jepa_smoke.sbatch` or export them before submission:
 
 ```bash
 export PROJECT_DIR="$HOME/quad-wm"
 export VENV_DIR="$PROJECT_DIR/.venv"
 export RUN_ROOT="$HOME/quad-wm-runs"
-sbatch scripts/slurm/track1_smoke.sbatch
+sbatch scripts/slurm/jepa_smoke.sbatch
 squeue --me
 tail -f "$RUN_ROOT/slurm/<job-id>.out"
 ```

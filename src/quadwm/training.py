@@ -21,6 +21,7 @@ from .data import (
     fetch_missions,
     materialized_missions,
     split_mission_names,
+    verify_joint_order_consistency,
 )
 from .models import (
     VJEPA21Encoder,
@@ -91,12 +92,18 @@ class TokenCache:
 
 
 def _cache_valid(root: Path, mission: str, image_ids: list[int], shape: tuple[int, ...]) -> bool:
+    """True when an existing cache has the same token dims and covers every id.
+
+    Superset reuse matters when an eval dataset indexes a subset of a mission
+    that training already cached -- rebuilding would clobber the train cache.
+    """
     metadata_path = root / f"{mission}.json"
     mmap_path = root / f"{mission}.mmap"
     if not metadata_path.is_file() or not mmap_path.is_file():
         return False
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    return metadata["image_ids"] == image_ids and tuple(metadata["shape"]) == shape
+    existing_shape = tuple(metadata["shape"])
+    return existing_shape[1:] == shape[1:] and set(image_ids) <= set(metadata["image_ids"])
 
 
 def _mission_image_ids(dataset, reader_index: int) -> list[int]:
@@ -266,6 +273,28 @@ def _evaluate(
     return {key: value / max(batches, 1) for key, value in totals.items()}
 
 
+def _check_dataset(
+    dataset, data_config: dict, *, name: str, check_drop_rate: bool = True
+) -> None:
+    """Fail fast on empty, desynced, or mis-ordered data before a long run commits."""
+    if not len(dataset):
+        raise ValueError(f"{name} dataset is empty")
+    if check_drop_rate:
+        max_drop_rate = float(data_config.get("max_drop_rate", 0.3))
+        rate = float(dataset.stats["drop_rate"])
+        if rate > max_drop_rate:
+            raise ValueError(
+                f"{name} drop_rate {rate:.2%} exceeds max_drop_rate {max_drop_rate:.2%} "
+                "-- check sync settings before trusting this data"
+            )
+    for reader in dataset.readers:
+        if not verify_joint_order_consistency(reader.root):
+            raise ValueError(
+                "joint order mismatch between anymal_state_actuator and "
+                f"anymal_state_state_estimator in {reader.mission_dir}"
+            )
+
+
 def train(config: dict) -> None:
     rank, world_size, local_rank, device = _distributed()
     _seed(int(config.get("seed", 4551)), rank)
@@ -300,8 +329,8 @@ def train(config: dict) -> None:
 
     eval_fraction = float(data_cfg.get("eval_fraction", 0.0))
     train_missions = data_cfg.get("missions")
-    eval_missions: list[str] | None = None
-    if eval_fraction > 0:
+    eval_missions: list[str] | None = data_cfg.get("eval_missions")
+    if eval_missions is None and eval_fraction > 0:
         available = materialized_missions(data_root, data_cfg.get("missions"))
         if len(available) >= 2:
             train_missions, eval_missions = split_mission_names(
@@ -317,7 +346,8 @@ def train(config: dict) -> None:
             )
     if rank == 0 and eval_missions is not None:
         print(
-            f"stage=split train_missions={len(train_missions)} "
+            f"stage=split train_missions="
+            f"{len(train_missions) if train_missions is not None else 'all'} "
             f"eval_missions={len(eval_missions)} eval={','.join(eval_missions)}",
             flush=True,
         )
@@ -336,8 +366,7 @@ def train(config: dict) -> None:
         load_images=True,
         missions=train_missions,
     )
-    if not len(dataset):
-        raise ValueError("sequence dataset is empty")
+    _check_dataset(dataset, data_cfg, name="sequence")
     if rank == 0:
         print(
             f"stage=dataset status=ready missions={len(dataset.readers)} "
@@ -361,8 +390,7 @@ def train(config: dict) -> None:
             load_images=True,
             missions=eval_missions,
         )
-        if not len(eval_dataset):
-            raise ValueError("held-out eval dataset is empty")
+        _check_dataset(eval_dataset, data_cfg, name="held-out eval", check_drop_rate=False)
         if rank == 0:
             print(
                 f"stage=eval_dataset status=ready missions={len(eval_dataset.readers)} "
@@ -500,6 +528,10 @@ def train(config: dict) -> None:
                     batch["visual_tokens"] = visual_tokens
                 losses = model(batch)
                 loss = losses["loss"] / accumulation
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"non-finite loss at step {global_step + 1}: {float(loss)}"
+                )
             loss.backward()
             if (step + 1) % accumulation == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["training"].get("clip_grad_norm", 1.0)))

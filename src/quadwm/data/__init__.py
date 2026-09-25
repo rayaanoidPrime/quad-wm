@@ -1,8 +1,6 @@
 """Canonical trajectory schemas and dataset adapters."""
 
 from .grandtour import (
-  GrandTourPairDataset,
-  build_dataset,
   build_sequence_dataset,
   fetch_missions,
   inspect_mission,
@@ -14,8 +12,6 @@ from .grandtour import (
 )
 
 __all__ = [
-    "GrandTourPairDataset",
-    "build_dataset",
     "build_sequence_dataset",
     "fetch_missions",
     "inspect_mission",

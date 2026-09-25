@@ -34,6 +34,8 @@ training:
   weight_decay: 0.0001
   clip_grad_norm: 1.0
   log_every_steps: 1
+  eval_every_steps: 1
+  eval_max_batches: 1
   resume: ""
 
 wandb:
