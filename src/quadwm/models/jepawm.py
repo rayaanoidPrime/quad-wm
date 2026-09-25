@@ -120,7 +120,7 @@ class RotaryAttention(nn.Module):
         output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.proj(output.transpose(1, 2).reshape(batch, length, dim))
 
-
+# TODO understand this
 class AdaLNBlock(nn.Module):
     def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
         super().__init__()
@@ -171,7 +171,7 @@ class Predictor(nn.Module):
         mask = self._mask(frames, values.device)
         for block in self.blocks:
             values = block(values, condition, mask)
-        return self.norm(values).reshape(batch, frames, tokens, dim)[:, -1]
+        return self.norm(values).reshape(batch, frames, tokens, dim)[:, -1] # take the last frame [B, 576, 784]
 
 
 class JEPAWorldModel(nn.Module):
@@ -196,8 +196,8 @@ class JEPAWorldModel(nn.Module):
         self.context_steps = context_steps
         self.rollout_context = rollout_context
         self.visual_encoder = encoder
-        self.proprio_encoder = EncoderProjection(proprio_dim, proprio_embed_dim)
-        self.action_encoder = EncoderProjection(action_dim, self.model_dim)
+        self.proprio_encoder = EncoderProjection(proprio_dim, proprio_embed_dim) # [B, T, 33] -> [B, T, 16]
+        self.action_encoder = EncoderProjection(action_dim, self.model_dim) # [B,T, 120] -> [B,T,784]
         self.predictor = Predictor(
             self.model_dim,
             predictor_heads,
@@ -212,33 +212,33 @@ class JEPAWorldModel(nn.Module):
         return self.visual_encoder(images)
 
     def encode_observation(self, visual: Tensor, proprio: Tensor) -> Tensor:
-        prop = self.proprio_encoder(proprio).unsqueeze(-2)
-        prop = prop.expand(*prop.shape[:-2], visual.shape[-2], prop.shape[-1])
-        return torch.cat((visual, prop), dim=-1)
+        prop = self.proprio_encoder(proprio).unsqueeze(-2) # [B,T,1,16]
+        prop = prop.expand(*prop.shape[:-2], visual.shape[-2], prop.shape[-1]) # [B,T,576,16]
+        return torch.cat((visual, prop), dim=-1) # [B, T, 576, 784]
 
     def predict_next(self, context: Tensor, actions: Tensor) -> Tensor:
-        action = self.action_encoder(actions)
+        action = self.action_encoder(actions) # [B, T , 784]
         if action.ndim == 2:
             action = action.unsqueeze(1).expand(-1, context.shape[1], -1)
         return self.predictor(context, action)
 
     def loss(self, visual_tokens: Tensor, proprio: Tensor, actions: Tensor) -> dict[str, Tensor]:
-        observations = self.encode_observation(visual_tokens, proprio)
+        observations = self.encode_observation(visual_tokens, proprio) # [B,T,576, 784]
         context_steps = self.context_steps
         if observations.shape[1] <= context_steps or actions.shape[1] < context_steps:
             raise ValueError(
                 f"expected observations={context_steps + 1}+ and actions={context_steps}+, "
                 f"got {observations.shape[1]} and {actions.shape[1]}"
             )
-        context = observations[:, :context_steps]
-        rollout_actions = actions[:, context_steps - 1 :]
+        context = observations[:, :context_steps] # [B, 7, 576, 784] first 7 frames as context
+        rollout_actions = actions[:, context_steps - 1 :] # [B, future actions, 120]
         losses: dict[str, Tensor] = {}
         rollout_losses = []
         visual_losses = []
         proprio_losses = []
         for step, action in enumerate(rollout_actions.unbind(dim=1)):
-            predictor_context = context if step == 0 else context[:, -self.rollout_context :]
-            prediction = self.predict_next(predictor_context, action)
+            predictor_context = context if step == 0 else context[:, -self.rollout_context :] # take all frames for step 0 then last rollout window from next steps
+            prediction = self.predict_next(predictor_context, action) # [B, 576, 784]
             target = observations[:, context_steps + step].detach()
             visual_loss = F.mse_loss(prediction[..., : self.visual_dim], target[..., : self.visual_dim])
             proprio_loss = F.mse_loss(prediction[..., self.visual_dim :], target[..., self.visual_dim :])
@@ -308,11 +308,11 @@ class JEPAWorldModel(nn.Module):
     def training_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if "visual_tokens" in batch:
             visual_tokens = batch["visual_tokens"]
-        else:
-            images = batch["images"]
-            batch_size, frames = images.shape[:2]
-            visual_tokens = self.encode_visual(images.reshape(batch_size * frames, *images.shape[2:]))
-            visual_tokens = visual_tokens.reshape(batch_size, frames, *visual_tokens.shape[1:])
+        else: 
+            images = batch["images"]  # (B,T,C,H,W)
+            batch_size, frames = images.shape[:2] 
+            visual_tokens = self.encode_visual(images.reshape(batch_size * frames, *images.shape[2:])) # vjepa21( [B*T, C, H, W]) -> [BT, 576, 768]
+            visual_tokens = visual_tokens.reshape(batch_size, frames, *visual_tokens.shape[1:]) # [B, T, 576, 768]
         return self.loss(visual_tokens, batch["proprio"], batch["actions"])
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
