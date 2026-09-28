@@ -796,20 +796,29 @@ def build_sequence_dataset(
     )
 
 
-def verify_joint_order_consistency(mission_root, n_samples: int = 5, atol: float = 1e-3) -> bool:
+def verify_joint_order_consistency(mission_root, n_samples: int = 2000) -> bool:
     """Check that anymal_state_state_estimator.joint_positions follows the
     same joint order as anymal_state_actuator (confirmed: JOINT_ORDER above).
 
     state_estimator's own topic description does not restate this ordering --
     run this once per mission before trusting it, rather than assuming it
     matches the actuator topic's documented order.
+
+    The topics are logged separately (different sample counts), so samples
+    are matched by timestamp, not array index. Each estimator joint must
+    track the same-position actuator joint more closely than any other; the
+    two never agree exactly (estimate vs. raw reading, ~1-2 mrad apart).
     """
-    est = mission_root["anymal_state_state_estimator"]
-    n = est["timestamp"].shape[0]
-    for idx in np.linspace(0, n - 1, num=min(n_samples, n), dtype=int):
-        est_positions = np.asarray(est["joint_positions"][idx])
-        for j in range(len(JOINT_ORDER)):
-            actuator_val = mission_root["anymal_state_actuator"][f"{j:02d}_state_joint_position"][idx]
-            if not np.isclose(est_positions[j], actuator_val, atol=atol):
-                return False
+    est, act = mission_root["anymal_state_state_estimator"], mission_root["anymal_state_actuator"]
+    est_t, act_t = np.asarray(est["timestamp"][:]), np.asarray(act["timestamp"][:])
+    times = np.linspace(max(est_t[0], act_t[0]), min(est_t[-1], act_t[-1]), n_samples)
+    est_q = np.asarray(est["joint_positions"][:])[_nearest_indices(est_t, times)[0]]
+    act_q = np.stack(
+        [np.asarray(act[f"{j:02d}_state_joint_position"][:]) for j in range(len(JOINT_ORDER))], axis=1
+    )[_nearest_indices(act_t, times)[0]]
+    error = np.abs(est_q[:, :, None] - act_q[:, None, :]).mean(axis=0)  # [estimator joint, actuator joint]
+    matched = error.argmin(axis=1)
+    if not (matched == np.arange(len(JOINT_ORDER))).all():
+        print(f"joint order check: estimator joint i best matches actuator joint {matched.tolist()}", flush=True)
+        return False
     return True
