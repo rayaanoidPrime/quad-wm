@@ -20,10 +20,12 @@ from .data import (
     build_sequence_dataset,
     fetch_missions,
     materialized_missions,
+    normalization_stats,
     split_mission_names,
     verify_joint_order_consistency,
 )
 from .models import (
+    LeWorldModel,
     VJEPA21Encoder,
     build_model,
     ensure_vjepa21_checkpoint,
@@ -223,6 +225,11 @@ def _load_token_caches(cache_root: Path, readers, use_cache: bool) -> list[Token
     ]
 
 
+def _from_scratch(config: dict) -> bool:
+    """True for the end-to-end model: no frozen V-JEPA encoder, checkpoint, or token cache."""
+    return config["model"].get("type") == "lewm"
+
+
 def _batch_visual_tokens(
     model: torch.nn.Module,
     batch: dict,
@@ -258,11 +265,16 @@ def _evaluate(
     totals: dict[str, float] = {}
     batches = 0
     for batch in loader:
-        visual_tokens = _batch_visual_tokens(model, batch, caches, device, image_size, use_cache)
-        batch["proprio"] = batch["proprio"].to(device, non_blocking=True)
-        batch["actions"] = batch["actions"].to(device, non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=precision):
-            metrics = module.evaluate(visual_tokens, batch["proprio"], batch["actions"])
+        if isinstance(module, LeWorldModel):
+            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            with torch.autocast(device_type="cuda", dtype=precision):
+                metrics = module.evaluate(batch)
+        else:
+            visual_tokens = _batch_visual_tokens(model, batch, caches, device, image_size, use_cache)
+            batch["proprio"] = batch["proprio"].to(device, non_blocking=True)
+            batch["actions"] = batch["actions"].to(device, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=precision):
+                metrics = module.evaluate(visual_tokens, batch["proprio"], batch["actions"])
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
         batches += 1
@@ -295,8 +307,8 @@ def _check_dataset(
             )
 
 
-def prepare(config: dict) -> Path:
-    """Materialize configured GrandTour data and the V-JEPA 2.1 checkpoint.
+def prepare(config: dict) -> Path | None:
+    """Materialize configured GrandTour data and (frozen-encoder models) the V-JEPA 2.1 checkpoint.
 
     Idempotent, so it is safe to run interactively via ``quadwm prepare`` and
     again from ``train`` on the same job.
@@ -317,8 +329,10 @@ def prepare(config: dict) -> Path:
             data_cfg.get("download_topics"),
         )
         print("stage=data status=ready", flush=True)
-    checkpoint = ensure_vjepa21_checkpoint(checkpoint_root)
-    print(f"stage=checkpoint status=ready path={checkpoint}", flush=True)
+    checkpoint = None
+    if not _from_scratch(config):
+        checkpoint = ensure_vjepa21_checkpoint(checkpoint_root)
+        print(f"stage=checkpoint status=ready path={checkpoint}", flush=True)
     print("stage=prepare status=complete", flush=True)
     return checkpoint
 
@@ -349,13 +363,16 @@ def train(config: dict) -> None:
     eval_fraction = float(data_cfg.get("eval_fraction", 0.0))
     train_missions = data_cfg.get("missions")
     eval_missions: list[str] | None = data_cfg.get("eval_missions")
+    probe_missions: list[str] = data_cfg.get("probe_missions", [])
     if eval_missions is None and eval_fraction > 0:
         available = materialized_missions(data_root, data_cfg.get("missions"))
         if len(available) >= 2:
-            train_missions, eval_missions = split_mission_names(
+            # Probe-fit missions are never trained on (shared protocol §1.3 rule 4).
+            train_missions, eval_missions, probe_missions = split_mission_names(
                 available,
                 int(data_cfg.get("split_seed", config.get("seed", 4551))),
                 eval_fraction,
+                float(data_cfg.get("probe_fraction", 0.0)),
             )
         elif rank == 0:
             print(
@@ -367,9 +384,12 @@ def train(config: dict) -> None:
         print(
             f"stage=split train_missions="
             f"{len(train_missions) if train_missions is not None else 'all'} "
-            f"eval_missions={len(eval_missions)} eval={','.join(eval_missions)}",
+            f"eval_missions={len(eval_missions)} probe_missions={len(probe_missions)} "
+            f"eval={','.join(eval_missions)}",
             flush=True,
         )
+        splits = {"train": train_missions, "eval": eval_missions, "probe": probe_missions}
+        (run_root / "splits.json").write_text(json.dumps(splits, indent=2) + "\n", encoding="utf-8")
 
     dataset = build_sequence_dataset(
         data_cfg,
@@ -386,6 +406,15 @@ def train(config: dict) -> None:
         missions=train_missions,
     )
     _check_dataset(dataset, data_cfg, name="sequence")
+    if data_cfg.get("normalize", True):
+        # Training-split statistics only; eval data reuses them. Stored in the
+        # config so every checkpoint carries the transform it was trained with.
+        data_cfg["normalization"] = normalization_stats(dataset.readers, int(data_cfg["action_frames"]))
+        dataset.normalization = data_cfg["normalization"]
+        if rank == 0:
+            (run_root / "normalization.json").write_text(
+                json.dumps(data_cfg["normalization"]) + "\n", encoding="utf-8"
+            )
     if rank == 0:
         print(
             f"stage=dataset status=ready missions={len(dataset.readers)} "
@@ -410,6 +439,7 @@ def train(config: dict) -> None:
             missions=eval_missions,
         )
         _check_dataset(eval_dataset, data_cfg, name="held-out eval", check_drop_rate=False)
+        eval_dataset.normalization = data_cfg.get("normalization")
         if rank == 0:
             print(
                 f"stage=eval_dataset status=ready missions={len(eval_dataset.readers)} "
@@ -418,7 +448,7 @@ def train(config: dict) -> None:
             )
 
     cache_cfg = config.get("cache", {})
-    use_cache = cache_cfg.get("mode", "auto") != "off"
+    use_cache = cache_cfg.get("mode", "auto") != "off" and not _from_scratch(config)
     cache_root = Path(cache_cfg.get("root", data_root / "quadwm-token-cache"))
     cache_root.parent.mkdir(parents=True, exist_ok=True)
     image_size = int(model_cfg.get("image_size", 384))
@@ -469,7 +499,7 @@ def train(config: dict) -> None:
             shuffle=False,
             num_workers=0,
         )
-    visual_encoder = None if use_cache else VJEPA21Encoder(checkpoint_root)
+    visual_encoder = None if use_cache or _from_scratch(config) else VJEPA21Encoder(checkpoint_root)
     model = build_model(model_cfg, checkpoint_root, visual_encoder=visual_encoder).to(device)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
@@ -537,6 +567,9 @@ def train(config: dict) -> None:
                 break
             if use_cache:
                 visual_tokens = _batch_tokens(batch, caches, device)
+            elif _from_scratch(config):  # raw depth in meters; the model tokenizes it
+                batch["images"] = batch["images"].to(device, non_blocking=True)
+                visual_tokens = None
             else:
                 batch["images"] = _prepare_images(batch["images"], device, image_size)
                 visual_tokens = None
@@ -568,8 +601,7 @@ def train(config: dict) -> None:
                 ):
                     print(
                         f"stage=train epoch={epoch + 1}/{epochs} step={global_step} "
-                        f"loss={metric['loss']:.6f} visual_loss={metric['visual_loss']:.6f} "
-                        f"proprio_loss={metric['proprio_loss']:.6f}",
+                        + " ".join(f"{key}={value:.6f}" for key, value in metric.items() if key.endswith("loss")),
                         flush=True,
                     )
                     if wandb_run is not None:
@@ -606,10 +638,7 @@ def train(config: dict) -> None:
                         wandb_run.log(eval_record, step=global_step)
                     print(
                         f"stage=eval step={global_step} "
-                        f"visual_mse={eval_metrics['visual_mse']:.6f} "
-                        f"proprio_mse={eval_metrics['proprio_mse']:.6f} "
-                        f"persistence_visual_mse={eval_metrics['step_1/persistence_visual_mse']:.6f} "
-                        f"proprio_variance={eval_metrics['proprio_variance']:.6f}",
+                        + " ".join(f"{key}={value:.6f}" for key, value in eval_metrics.items() if "/" not in key),
                         flush=True,
                     )
                 if do_eval:

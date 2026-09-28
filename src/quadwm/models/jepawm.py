@@ -251,6 +251,11 @@ class JEPAWorldModel(nn.Module):
         prop = prop.expand(*prop.shape[:-2], visual.shape[-2], prop.shape[-1]) # [B,T,576,16]
         return torch.cat((visual, prop), dim=-1) # [B, T, 576, 784]
 
+    def _normalized_slices(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
+        """Per-slice LayerNorm (no affine): the space every loss and metric uses."""
+        visual, prop = tokens[..., : self.visual_dim], tokens[..., self.visual_dim :]
+        return F.layer_norm(visual, (self.visual_dim,)), F.layer_norm(prop, (self.proprio_embed_dim,))
+
     def predict_next(self, context: Tensor, actions: Tensor) -> Tensor:
         action = self.action_encoder(actions) # [B, T , 784]
         if action.ndim == 2:
@@ -274,16 +279,8 @@ class JEPAWorldModel(nn.Module):
         for step, action in enumerate(rollout_actions.unbind(dim=1)):
             predictor_context = context if step == 0 else context[:, -self.rollout_context :] # take all frames for step 0 then last rollout window from next steps
             prediction = self.predict_next(predictor_context, action) # [B, 576, 784]
-            target = observations[:, context_steps + step].detach()
-            target_visual = target[..., :self.visual_dim]
-            target_prop = target[..., self.visual_dim:]
-
-            target_visual = F.layer_norm(
-                target_visual, (self.visual_dim,)
-            )
-
-            target_prop = F.layer_norm(
-                target_prop, (self.proprio_embed_dim,)
+            target_visual, target_prop = self._normalized_slices(
+                observations[:, context_steps + step].detach()
             )
             visual_loss = F.mse_loss(prediction[..., : self.visual_dim], target_visual)
             proprio_loss = F.mse_loss(prediction[..., self.visual_dim :], target_prop)
@@ -325,36 +322,18 @@ class JEPAWorldModel(nn.Module):
         for step, action in enumerate(rollout_actions.unbind(dim=1)):
             predictor_context = context if step == 0 else context[:, -self.rollout_context :]
             prediction = self.predict_next(predictor_context, action)
-            target = observations[:, context_steps + step]
             prefix = f"step_{step + 1}"
-            pred_visual = F.layer_norm(
-                prediction[..., :self.visual_dim],
-                (self.visual_dim,)
-            )
-            pred_prop = F.layer_norm(
-                prediction[..., self.visual_dim:],
-                (self.proprio_embed_dim,)
-            )
-
-            target_visual = F.layer_norm(
-                target[..., :self.visual_dim],
-                (self.visual_dim,)
-            )
-            target_prop = F.layer_norm(
-                target[..., self.visual_dim:],
-                (self.proprio_embed_dim,)
-            )
-
+            # Model, target and persistence all go through the same per-slice
+            # LayerNorm, so the persistence gate compares like with like.
+            pred_visual, pred_prop = self._normalized_slices(prediction)
+            target_visual, target_prop = self._normalized_slices(observations[:, context_steps + step])
+            persist_visual, persist_prop = self._normalized_slices(persistence)
             visual = F.mse_loss(pred_visual, target_visual)
             prop = F.mse_loss(pred_prop, target_prop)
             metrics[f"{prefix}/visual_mse"] = float(visual)
             metrics[f"{prefix}/proprio_mse"] = float(prop)
-            metrics[f"{prefix}/persistence_visual_mse"] = float(
-                F.mse_loss(persistence[..., : self.visual_dim], target[..., : self.visual_dim])
-            )
-            metrics[f"{prefix}/persistence_proprio_mse"] = float(
-                F.mse_loss(persistence[..., self.visual_dim :], target[..., self.visual_dim :])
-            )
+            metrics[f"{prefix}/persistence_visual_mse"] = float(F.mse_loss(persist_visual, target_visual))
+            metrics[f"{prefix}/persistence_proprio_mse"] = float(F.mse_loss(persist_prop, target_prop))
             visual_errors.append(visual)
             proprio_errors.append(prop)
             context = torch.cat(

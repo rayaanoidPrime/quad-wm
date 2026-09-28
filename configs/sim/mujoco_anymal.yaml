@@ -1,0 +1,36 @@
+# MuJoCo ANYmal simulator (docs/adr/0003). Assets live outside Git:
+#   git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie \
+#     "$QUADWM_SIM_ASSETS/mujoco_menagerie"
+# Headless nodes: export MUJOCO_GL=egl.
+name: sim-smoke
+seed: 0
+smoke_ticks: 25
+smoke_terrains: [flat, rough, slope, stairs]
+
+sim:
+  backend: mujoco
+  # STAND-IN: Menagerie ships ANYmal B/C, not D. Joint names and order match
+  # GrandTour's ANYmal D; masses, link lengths and actuators do not.
+  mjcf: ${QUADWM_SIM_ASSETS:-/scratch/quad-wm/assets}/mujoco_menagerie/anybotics_anymal_c/anymal_c.xml
+  base_body: base
+  # Same clock as configs/data/baseline.yaml: 5 Hz ticks of 10 x 50 Hz targets.
+  tick_hz: 5
+  control_hz: 50
+  kp: 100.0
+  kd: 2.0
+  spawn_height: 0.62
+  # JOINT_ORDER; the ANYmal standing pose used by Isaac Lab's ANYmal configs.
+  default_joint_pos: [0.0, 0.4, -0.8, 0.0, 0.4, -0.8, 0.0, -0.4, 0.8, 0.0, -0.4, 0.8]
+  terrain:
+    length_m: 20.0
+    width_m: 8.0
+    cell_m: 0.05
+  camera:
+    # Placeholder mount; matching GrandTour's front camera (Boxi extrinsics,
+    # fisheye, ~126x92 deg FoV) is an open compatibility test.
+    pos: [0.45, 0.0, 0.10]
+    pitch_deg: 20.0
+    fovy_deg: 92.0
+    width: 128
+    height: 128
+    modalities: [rgb, depth]

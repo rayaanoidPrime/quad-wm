@@ -1,0 +1,24 @@
+data_root: ${GRANDTOUR_ROOT}
+
+# Track 1 observation: front depth camera + proprioception, all missions.
+download: true
+download_topics:
+  - depth_camera_front_upper
+  - anymal_state_state_estimator
+  - anymal_state_actuator
+observation: depth_plus_proprioception
+depth_size: 64            # valid-pixel area pooling in the dataset; = model.image_size
+depth_range: [0.2, 10.0]  # meters; outside (incl. 0 = no return) is invalid
+platform: anymal_d
+tick_hz: 5
+control_hz: 50
+action_frames: 10
+max_gap_ms: 50
+max_drop_rate: 0.3
+calibration: per_mission
+
+normalize: true
+eval_fraction: 0.2
+probe_fraction: 0.2  # docs/adr/0001
+split_seed: 4551
+eval_max_sequences: 256

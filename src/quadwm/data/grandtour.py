@@ -32,6 +32,7 @@ import torch
 import zarr
 from huggingface_hub import list_repo_files, scan_cache_dir, snapshot_download
 from scipy.spatial.transform import Rotation
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 GRANDTOUR_REPO_ID = "leggedrobotics/grand_tour_dataset"
@@ -67,6 +68,17 @@ OBSERVATION_TOPICS = {
 
 _GRAVITY_WORLD = np.array([0.0, 0.0, -1.0])  # world frame, z-up
 
+# Model input (33-d) and shared-protocol probe target (40-d, protocol §1.1).
+PROPRIO_LAYOUT = {
+    "lin_vel": slice(0, 3), "ang_vel": slice(3, 6), "gravity": slice(6, 9),
+    "joint_pos": slice(9, 21), "joint_vel": slice(21, 33),
+}
+STATE_LAYOUT = {
+    "base_pos": slice(0, 3), "lin_vel": slice(3, 6), "ang_vel": slice(6, 9),
+    "gravity": slice(9, 12), "joint_pos": slice(12, 24), "joint_vel": slice(24, 36),
+    "contacts": slice(36, 40),
+}
+
 
 def resolve_topics(observation: str, platform: str) -> dict[str, str]:
     try:
@@ -78,10 +90,69 @@ def resolve_topics(observation: str, platform: str) -> dict[str, str]:
         ) from exc
 
 
+def valid_quat(quat_xyzw: np.ndarray) -> np.ndarray:
+    """Estimator warm-up rows can be all-zero, which scipy rejects; treat them as identity."""
+    quat_xyzw = np.array(quat_xyzw, dtype=np.float64)
+    quat_xyzw[np.linalg.norm(quat_xyzw, axis=-1) < 1e-6] = [0.0, 0.0, 0.0, 1.0]
+    return quat_xyzw
+
+
 def project_gravity(quat_xyzw: np.ndarray) -> np.ndarray:
     """Rotate the world gravity direction into the base frame."""
-    rot = Rotation.from_quat(quat_xyzw)  # GrandTour stores (x, y, z, w)
+    rot = Rotation.from_quat(valid_quat(quat_xyzw))  # GrandTour stores (x, y, z, w)
     return rot.inv().apply(_GRAVITY_WORLD)
+
+
+def state_vectors(states: list[dict]) -> np.ndarray:
+    """[T, 40] probe targets for one window (layout: STATE_LAYOUT).
+
+    Absolute odometry position is not predictable from egocentric input, so
+    base position is expressed relative to the window's first tick, rotated
+    into that tick's yaw-aligned frame (docs/adr/0002).
+    """
+    yaw = Rotation.from_quat(states[0]["orientation"]).as_euler("zyx")[0]
+    to_start = Rotation.from_euler("z", -yaw)
+    origin = states[0]["pose_pos"]
+    return np.stack([
+        np.concatenate((
+            to_start.apply(state["pose_pos"] - origin), state["lin_vel"], state["ang_vel"],
+            state["gravity"], state["joint_pos"], state["joint_vel"], state["contacts"],
+        ))
+        for state in states
+    ]).astype(np.float32)
+
+
+def pool_depth(depth_m: np.ndarray, size: int, depth_range: tuple[float, float]) -> torch.Tensor:
+    """[H, W] meters -> [2, size, size]: mean of valid pixels per cell, and valid fraction.
+
+    Pixels outside ``depth_range`` (including 0 = no return, and NaN) are
+    invalid and excluded from the mean, so they never blur into real depth.
+    Done in the data layer so batches carry 64x64 cells, not full frames.
+    """
+    low, high = depth_range
+    depth = torch.from_numpy(depth_m)[None, None]
+    valid = ((depth > low) & (depth < high)).float()
+    coverage = F.interpolate(valid, size=(size, size), mode="area")
+    mean = F.interpolate(torch.nan_to_num(depth) * valid, size=(size, size), mode="area")
+    return torch.cat((mean / coverage.clamp_min(1e-6), coverage), dim=1)[0]
+
+
+def normalization_stats(readers: list[MissionReader], action_frames: int) -> dict[str, list[float]]:
+    """Per-dimension mean/std of model inputs over training missions (recipe §2.3).
+
+    Computed over every logged sample rather than only the sampled windows, so
+    it is cheap and independent of window settings.  Actions are per-joint
+    statistics tiled over the ``action_frames`` stacked commands.
+    """
+    proprio = np.concatenate([reader.proprio_vectors for reader in readers])
+    actions = np.concatenate([reader.actions for reader in readers])
+    std = lambda values: np.maximum(values.std(axis=0), 1e-6)
+    return {
+        "proprio_mean": proprio.mean(axis=0).tolist(),
+        "proprio_std": std(proprio).tolist(),
+        "action_mean": np.tile(actions.mean(axis=0), action_frames).tolist(),
+        "action_std": np.tile(std(actions), action_frames).tolist(),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -201,11 +272,20 @@ def materialize_mission(mission: str | Path) -> int:
     return len(archives)
 
 
-def split_mission_names(names: list[str], seed: int, eval_fraction: float = 0.2) -> tuple[list[str], list[str]]:
+def split_mission_names(
+    names: list[str], seed: int, eval_fraction: float = 0.2, probe_fraction: float = 0.0
+) -> tuple[list[str], list[str], list[str]]:
+    """Mission-level (train, eval, probe) split; see docs/adr/0001.
+
+    The eval missions are the first slice of the seeded shuffle, so adding a
+    probe split never changes which missions are held out for evaluation.
+    """
     shuffled = sorted(names)
     random.Random(seed).shuffle(shuffled)
     eval_count = max(1, round(len(shuffled) * eval_fraction)) if shuffled else 0
-    return shuffled[eval_count:], shuffled[:eval_count]
+    probe_count = round(len(shuffled) * probe_fraction)
+    probe_end = eval_count + probe_count
+    return shuffled[probe_end:], shuffled[:eval_count], shuffled[eval_count:probe_end]
 
 
 # GrandTour publishes Zarr v2 stores: topics are sub-groups directly under
@@ -427,6 +507,17 @@ class MissionReader:
                 axis=1,
             ),
         }
+        # The 33-d model input for every logged sample (layout: PROPRIO_LAYOUT).
+        self.proprio_vectors = np.concatenate(
+            (
+                self.proprio["twist_lin"],
+                self.proprio["twist_ang"],
+                project_gravity(self.proprio["pose_orien"]).reshape(-1, 3).astype(np.float32),
+                self.proprio["joint_positions"],
+                self.proprio["joint_velocities"],
+            ),
+            axis=1,
+        )
         actuator = self.actuator_group
         self.actions = np.stack(
             [
@@ -485,8 +576,10 @@ class MissionReader:
             return None
 
         state = self.proprio
-        quat = state["pose_orien"][p_idx]  # (x, y, z, w)
+        quat = valid_quat(state["pose_orien"][p_idx])  # (x, y, z, w)
         return {
+            "proprio": self.proprio_vectors[p_idx],
+            "orientation": quat,
             "pose_pos": state["pose_pos"][p_idx],
             "lin_vel": state["twist_lin"][p_idx],
             "ang_vel": state["twist_ang"][p_idx],
@@ -541,8 +634,11 @@ class GrandTourSequenceDataset(Dataset):
         max_tick_error_s: float = 0.06,
         max_sequences: int | None = None,
         load_images: bool = True,
+        depth_size: int = 64,
+        depth_range: tuple[float, float] = (0.2, 10.0),
     ):
         self.readers = readers
+        self.depth_size, self.depth_range = depth_size, tuple(depth_range)
         self.context_steps = context_steps
         self.rollout_steps = rollout_steps
         self.total_steps = context_steps + rollout_steps
@@ -550,8 +646,10 @@ class GrandTourSequenceDataset(Dataset):
         self.control_hz = control_hz
         self.action_frames = action_frames
         self.load_images = load_images
+        # Set from training-split statistics (normalization_stats) by the caller.
+        self.normalization: dict[str, list[float]] | None = None
         self.index: list[tuple[int, tuple[int, ...]]] = []
-        dropped = 0
+        dropped = candidates = 0
         for reader_index, reader in enumerate(readers):
             if len(reader) == 0:
                 continue
@@ -583,19 +681,20 @@ class GrandTourSequenceDataset(Dataset):
             _, window_gap = _nearest_indices(reader.actuator_timestamps, window_times)
             valid &= (window_gap <= reader.max_gap_s).all(axis=(1, 2))
 
+            # Rate over all candidate windows, before the max_sequences cap.
             dropped += int((~valid).sum())
+            candidates += len(valid)
             kept = 0
             for row in ids[valid]:
                 self.index.append((reader_index, tuple(int(image_id) for image_id in row)))
                 kept += 1
                 if max_sequences is not None and kept >= max_sequences:
                     break
-        total = dropped + len(self.index)
         self.stats = {
-            "total": total,
+            "total": candidates,
             "kept": len(self.index),
             "dropped": dropped,
-            "drop_rate": dropped / total if total else 0.0,
+            "drop_rate": dropped / candidates if candidates else 0.0,
         }
 
     def __len__(self) -> int:
@@ -606,20 +705,7 @@ class GrandTourSequenceDataset(Dataset):
         reader = self.readers[reader_index]
         states = [reader.sample_state(float(reader.depth_timestamps[i])) for i in image_ids]
         assert all(state is not None for state in states)
-        proprio = np.stack(
-            [
-                np.concatenate(
-                    (
-                        state["lin_vel"],
-                        state["ang_vel"],
-                        state["gravity"],
-                        state["joint_pos"],
-                        state["joint_vel"],
-                    )
-                )
-                for state in states
-            ]
-        )
+        proprio = np.stack([state["proprio"] for state in states])
         actions = np.stack(
             [
                 reader.sample_action_window(
@@ -630,13 +716,22 @@ class GrandTourSequenceDataset(Dataset):
                 for i in image_ids[:-1]
             ]
         )
+        if self.normalization is not None:
+            stats = {key: np.asarray(value, dtype=np.float32) for key, value in self.normalization.items()}
+            proprio = (proprio - stats["proprio_mean"]) / stats["proprio_std"]
+            actions = (actions - stats["action_mean"]) / stats["action_std"]
         output = {
             "proprio": torch.from_numpy(proprio).float(),
             "actions": torch.from_numpy(actions).float(),
+            "state": torch.from_numpy(state_vectors(states)),  # raw units, never normalized here
             "mission_idx": reader_index,
             "image_ids": torch.tensor(image_ids, dtype=torch.long),
         }
-        if self.load_images:
+        if self.load_images and "depth" in reader.depth_topic:
+            output["images"] = torch.stack(  # [T, 2, S, S]: depth (m), valid fraction
+                [pool_depth(reader.load_depth(i), self.depth_size, self.depth_range) for i in image_ids]
+            )
+        elif self.load_images:
             observations = np.stack([reader.load_image(i) for i in image_ids])
             output["images"] = torch.from_numpy(observations).permute(0, 3, 1, 2).float()
         return output
@@ -696,6 +791,8 @@ def build_sequence_dataset(
         action_frames=action_frames,
         max_sequences=max_sequences,
         load_images=load_images,
+        depth_size=int(data_config.get("depth_size", 64)),
+        depth_range=tuple(data_config.get("depth_range", (0.2, 10.0))),
     )
 
 
@@ -708,7 +805,7 @@ def verify_joint_order_consistency(mission_root, n_samples: int = 5, atol: float
     matches the actuator topic's documented order.
     """
     est = mission_root["anymal_state_state_estimator"]
-    n = len(est["timestamp"])
+    n = est["timestamp"].shape[0]
     for idx in np.linspace(0, n - 1, num=min(n_samples, n), dtype=int):
         est_positions = np.asarray(est["joint_positions"][idx])
         for j in range(len(JOINT_ORDER)):

@@ -17,7 +17,12 @@ max_drop_rate: 0.3
 sync_rate_hz: 10
 calibration: per_mission
 
+# Standardize proprio/actions with training-split statistics (recipe §2.3).
+normalize: true
+
 # Held-out evaluation: partition by mission, never train/probe/tune on these.
 eval_fraction: 0.2
+# Probe-fit missions: never trained on, disjoint from eval (docs/adr/0001).
+probe_fraction: 0.2
 split_seed: 4551
 eval_max_sequences: 256

@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from .jepawm import JEPAWorldModel, VJEPA21_FILENAME
+from .lewm import LeWorldModel
 
 VJEPA21_URL = f"https://dl.fbaipublicfiles.com/vjepa2/{VJEPA21_FILENAME}"
 
@@ -84,8 +85,11 @@ def build_model(
     checkpoint_root: str | Path,
     *,
     visual_encoder: torch.nn.Module | None = None,
-) -> JEPAWorldModel:
-    """Build the configured Track 1 baseline model."""
+) -> JEPAWorldModel | LeWorldModel:
+    """Build the configured Track 1 model: ``type: lewm`` or the frozen-encoder baseline."""
+    if wm_config.get("type") == "lewm":
+        # Every other model key is a constructor argument, so a typo fails loudly.
+        return LeWorldModel(**{key: value for key, value in wm_config.items() if key != "type"})
     return JEPAWorldModel(
         visual_dim=int(wm_config.get("visual_dim", 768)),
         proprio_dim=int(wm_config.get("proprio_dim", 33)),

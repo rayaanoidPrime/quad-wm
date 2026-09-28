@@ -1,0 +1,41 @@
+name: lewm-depth-smoke
+seed: 4551
+
+run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
+checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
+data_config: configs/data/grandtour_depth_smoke.yaml
+
+model:
+  type: lewm
+  encoder_depth: 1
+  predictor_depth: 1
+  context_steps: 2
+  rollout_steps: 2
+  sigreg_slices: 64
+  loss_weights: {state: 1.0, transition: 1.0}  # exercise every loss term
+  transition_horizons: [1, 2]
+
+training:
+  epochs: 1
+  max_steps: 3
+  per_gpu_batch_size: 2
+  gradient_accumulation_steps: 1
+  num_workers: 0
+  precision: bf16
+  learning_rate: 0.0003
+  weight_decay: 0.05
+  clip_grad_norm: 1.0
+  log_every_steps: 1
+  eval_every_steps: 1
+  eval_max_batches: 1
+  resume: ""
+
+wandb:
+  enabled: ${QUADWM_WANDB_ENABLED:-true}
+  project: jepa-wm
+  name: lewm-depth-smoke-${SLURM_JOB_ID:-local}
+  group: lewm-depth-smoke
+  job_type: smoke
+  tags:
+    - slurm-${SLURM_JOB_ID:-local}
+  mode: ${WANDB_MODE:-online}

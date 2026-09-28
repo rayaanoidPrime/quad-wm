@@ -2,10 +2,12 @@ data_root: ${GRANDTOUR_ROOT}
 missions: ["2024-11-02-17-18-32"]
 download: true
 download_topics:
-  - alphasense_front_center
+  - depth_camera_front_upper
   - anymal_state_state_estimator
   - anymal_state_actuator
-observation: rgb_plus_proprioception
+observation: depth_plus_proprioception
+depth_size: 64            # valid-pixel area pooling in the dataset; = model.image_size
+depth_range: [0.2, 10.0]  # meters; outside (incl. 0 = no return) is invalid
 platform: anymal_d
 tick_hz: 5
 control_hz: 50
@@ -14,7 +16,6 @@ max_sequences: 8
 normalize: true
 eval_missions: ["2024-11-02-17-18-32"]  # same mission: smoke covers the eval code path cheaply
 eval_max_sequences: 2
-max_drop_rate: 0.3        # fail fast if the depth/state/action sync degrades
-sync_rate_hz: 10          # camera rate, the base clock
+max_drop_rate: 0.3
 max_gap_ms: 50
-calibration: per_mission  # reload K/D/transform per mission, never cache
+calibration: per_mission

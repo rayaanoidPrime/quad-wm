@@ -1,0 +1,187 @@
+"""Track 1 from-scratch JEPA world model: depth + proprio, trained end to end.
+
+LeWM-style (arXiv 2603.19312): encoder and predictor train jointly with a
+next-latent MSE and SIGReg as the only anti-collapse term (no EMA target,
+no stop-gradient). Track 1 recipe additions: symlog depth tokenizer (§2.1)
+and optional PSG-JEPA grounding heads (§2.4, training only). See
+docs/adr/0004 for where this departs from the recipe.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from ..data.grandtour import PROPRIO_LAYOUT
+from .jepawm import AdaLNBlock
+
+
+def sigreg(z: Tensor, slices: int = 1024, knots: int = 17, t_max: float = 3.0) -> Tensor:
+    """SIGReg (LeJEPA): Epps-Pulley distance of random 1-D projections of z from N(0, 1).
+
+    z: [..., N, D], statistic computed over the N samples of each leading
+    index and averaged. Minimized when z is an isotropic standard Gaussian,
+    which rules out collapsed (constant or low-rank) latents.
+    """
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        z = z.float()
+        directions = F.normalize(torch.randn(z.shape[-1], slices, device=z.device), dim=0)
+        t = torch.linspace(0.0, t_max, knots, device=z.device)
+        x = (z @ directions).unsqueeze(-1) * t  # [..., N, slices, knots]
+        gaussian = torch.exp(-0.5 * t**2)  # characteristic function of N(0, 1)
+        error = (x.cos().mean(-3) - gaussian) ** 2 + x.sin().mean(-3) ** 2
+        return torch.trapezoid(error * gaussian, t, dim=-1).mean() * z.shape[-2]
+
+
+def mlp(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Sequential:
+    return nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, output_dim))
+
+
+class DepthProprioEncoder(nn.Module):
+    """[B, 2, S, S] pooled depth (``grandtour.pool_depth``) + [B, 33] proprio -> [B, latent_dim]."""
+
+    def __init__(self, *, image_size, patch_size, dim, depth, heads, proprio_dim, latent_dim):
+        super().__init__()
+        self.image_size = image_size
+        # Two input channels: symlog depth and the fraction of valid pixels,
+        # so no-return regions are explicit rather than a sentinel value.
+        self.patchify = nn.Conv2d(2, dim, patch_size, patch_size)
+        self.proprio = mlp(proprio_dim, dim, dim)
+        self.cls = nn.Parameter(torch.zeros(1, 1, dim))
+        self.position = nn.Parameter(torch.randn(1, (image_size // patch_size) ** 2 + 2, dim) * 0.02)
+        layer = nn.TransformerEncoderLayer(dim, heads, 4 * dim, dropout=0.0, activation="gelu",
+                                           batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(layer, depth, enable_nested_tensor=False)
+        self.projector = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, latent_dim))
+
+    def forward(self, depth: Tensor, proprio: Tensor) -> Tensor:
+        if depth.shape[-1] != self.image_size:
+            raise ValueError(f"depth is {depth.shape[-1]}px but model.image_size={self.image_size}; match data.depth_size")
+        meters, coverage = depth[:, :1], depth[:, 1:]
+        symlog = torch.log1p(meters) * (coverage > 0)  # depth >= 0, so symlog = log1p (recipe §2.1)
+        patches = self.patchify(torch.cat((symlog, coverage), dim=1)).flatten(2).transpose(1, 2)
+        tokens = torch.cat((self.cls.expand(len(patches), -1, -1), self.proprio(proprio)[:, None], patches), 1)
+        return self.projector(self.transformer(tokens + self.position)[:, 0])
+
+
+class LatentPredictor(nn.Module):
+    """Frame-causal AdaLN transformer: latents [B, T, D] + actions [B, T, A] -> next latents."""
+
+    def __init__(self, *, latent_dim, dim, depth, heads, action_dim, window):
+        super().__init__()
+        self.window = window
+        self.lift = nn.Linear(latent_dim, dim)
+        self.action = mlp(action_dim, dim, dim)
+        self.blocks = nn.ModuleList(AdaLNBlock(dim, heads) for _ in range(depth))
+        self.head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, latent_dim))
+
+    def forward(self, latents: Tensor, actions: Tensor) -> Tensor:
+        frames = torch.arange(latents.shape[1], device=latents.device)
+        lag = frames[:, None] - frames[None, :]
+        mask = torch.zeros(lag.shape, device=latents.device).masked_fill((lag < 0) | (lag >= self.window), float("-inf"))
+        values, condition = self.lift(latents), self.action(actions)
+        for block in self.blocks:
+            values = block(values, condition, mask)
+        return self.head(values)  # position t predicts the latent at t + 1
+
+
+class LeWorldModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        image_size: int = 64,
+        patch_size: int = 8,
+        encoder_dim: int = 192,
+        encoder_depth: int = 12,
+        encoder_heads: int = 3,
+        latent_dim: int = 192,
+        predictor_dim: int = 384,
+        predictor_depth: int = 6,
+        predictor_heads: int = 6,
+        predictor_window: int = 4,
+        proprio_dim: int = 33,
+        action_dim: int = 120,
+        context_steps: int = 4,
+        rollout_steps: int = 4,
+        loss_weights: dict[str, float] | None = None,
+        sigreg_slices: int = 1024,
+        transition_horizons: tuple[int, ...] = (1, 4),
+    ):
+        super().__init__()
+        self.context_steps, self.rollout_steps = context_steps, rollout_steps
+        self.weights = {"pred": 1.0, "rollout": 1.0, "sigreg": 0.1, "state": 0.0, "transition": 0.0}
+        self.weights |= loss_weights or {}
+        self.sigreg_slices, self.transition_horizons = sigreg_slices, tuple(transition_horizons)
+        self.encoder = DepthProprioEncoder(
+            image_size=image_size, patch_size=patch_size, dim=encoder_dim, depth=encoder_depth,
+            heads=encoder_heads, proprio_dim=proprio_dim, latent_dim=latent_dim,
+        )
+        self.predictor = LatentPredictor(
+            latent_dim=latent_dim, dim=predictor_dim, depth=predictor_depth, heads=predictor_heads,
+            action_dim=action_dim, window=predictor_window,
+        )
+        # PSG-JEPA grounding heads: training only, built only when weighted so
+        # the base arm has no unused (DDP-breaking) parameters.
+        self.joint_slice = joints = PROPRIO_LAYOUT["joint_pos"]
+        self.state_head = mlp(latent_dim, 256, proprio_dim) if self.weights["state"] else None
+        self.transition_head = (
+            mlp(2 * latent_dim, 256, joints.stop - joints.start) if self.weights["transition"] else None
+        )
+
+    def encode(self, depth: Tensor, proprio: Tensor) -> Tensor:
+        """depth [B, T, 2, S, S], proprio [B, T, P] -> latents [B, T, D]."""
+        batch, frames = proprio.shape[:2]
+        latents = self.encoder(depth.flatten(0, 1), proprio.flatten(0, 1))
+        return latents.view(batch, frames, -1)
+
+    def rollout(self, context: Tensor, actions: Tensor, steps: int) -> Tensor:
+        """Open-loop: [B, W, D] context + actions aligned to frames (actions[:, i] moves
+        frame i to i + 1, so W + steps - 1 are needed) -> [B, steps, D] predicted latents."""
+        frames = context
+        for _ in range(steps):
+            start = max(0, frames.shape[1] - self.predictor.window)
+            following = self.predictor(frames[:, start:], actions[:, start : frames.shape[1]])[:, -1]
+            frames = torch.cat((frames, following[:, None]), dim=1)
+        return frames[:, context.shape[1] :]
+
+    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        proprio, actions = batch["proprio"], batch["actions"]
+        z = self.encode(batch["images"], proprio)
+        losses = {
+            # Teacher-forced next-latent loss at every position, in parallel.
+            "pred_loss": F.mse_loss(self.predictor(z[:, :-1], actions), z[:, 1:]),
+            # Per-timestep SIGReg over the batch (samples, not frames, are i.i.d.).
+            "sigreg_loss": sigreg(z.transpose(0, 1), slices=self.sigreg_slices),
+        }
+        if self.rollout_steps > 1:
+            future = self.rollout(z[:, : self.context_steps], actions, self.rollout_steps)
+            losses["rollout_loss"] = F.mse_loss(future, z[:, self.context_steps :])
+        if self.state_head is not None:
+            losses["state_loss"] = F.mse_loss(self.state_head(z), proprio)
+        if self.transition_head is not None:
+            joints = proprio[..., self.joint_slice]
+            losses["transition_loss"] = torch.stack([
+                F.mse_loss(self.transition_head(torch.cat((z[:, :-h], z[:, h:]), -1)), joints[:, h:] - joints[:, :-h])
+                for h in self.transition_horizons
+            ]).mean()
+        losses["loss"] = sum(self.weights[name.removesuffix("_loss")] * value for name, value in losses.items())
+        return losses
+
+    @torch.no_grad()
+    def evaluate(self, batch: dict[str, Tensor]) -> dict[str, float]:
+        """E1.1: per-step open-loop error vs persistence, plus collapse signatures."""
+        z = self.encode(batch["images"], batch["proprio"])
+        future = self.rollout(z[:, : self.context_steps], batch["actions"], self.rollout_steps)
+        targets, last = z[:, self.context_steps :], z[:, self.context_steps - 1 : self.context_steps]
+        metrics = {}
+        for step in range(self.rollout_steps):
+            metrics[f"step_{step + 1}/latent_mse"] = float(F.mse_loss(future[:, step], targets[:, step]))
+            metrics[f"step_{step + 1}/persistence_mse"] = float(F.mse_loss(last[:, 0], targets[:, step]))
+        metrics["relative_error"] = float((future - targets).norm(dim=-1).mean() / targets.norm(dim=-1).mean())
+        flat = z.flatten(0, 1).float()
+        metrics["latent_std"] = float(flat.std(0).mean())
+        singular = torch.linalg.svdvals(flat - flat.mean(0))
+        spectrum = singular / singular.sum()
+        metrics["effective_rank"] = float(torch.exp(-(spectrum * spectrum.clamp_min(1e-12).log()).sum()))
+        return metrics

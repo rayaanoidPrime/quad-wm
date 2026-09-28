@@ -21,7 +21,14 @@ def main() -> None:
     train_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/baseline.yaml"))
     prepare_parser = subparsers.add_parser("prepare", help="download the local encoder checkpoint and data")
     prepare_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/baseline.yaml"))
+    sim_parser = subparsers.add_parser("sim-smoke", help="E1.0 simulator gate: stand, render, measure FPS")
+    sim_parser.add_argument("--config", type=Path, default=Path("configs/sim/mujoco_anymal.yaml"))
     args = parser.parse_args()
+    if args.command == "sim-smoke":
+        from .sim import smoke
+
+        smoke(load_config(args.config))
+        return
     if args.command in ("smoke", "train"):
         # smoke is the same pipeline as train, just the tiny smoke config -- it
         # exercises download/data/cache/encoder/train/eval before a full run.

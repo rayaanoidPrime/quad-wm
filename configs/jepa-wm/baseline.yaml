@@ -1,4 +1,6 @@
-name: jepa-baseline
+# v2: normalized inputs + 3-way split (docs/adr/0001, 0002); fresh run dir so it
+# never resumes a pre-fix checkpoint.
+name: jepa-baseline-v2
 seed: 4551
 
 run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
@@ -38,13 +40,13 @@ training:
   eval_every_steps: 200
   eval_max_batches: 8
   # Stable path so a job killed at the walltime resumes the next submission.
-  resume: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}/jepa-baseline/last.pt
+  resume: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}/jepa-baseline-v2/last.pt
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}
   project: jepa-wm
   # job id in the run name so a dashboard run maps back to the Slurm job.
-  name: jepa-baseline-${SLURM_JOB_ID:-local}
+  name: jepa-baseline-v2-${SLURM_JOB_ID:-local}
   group: jepa-baseline
   job_type: train
   tags:
