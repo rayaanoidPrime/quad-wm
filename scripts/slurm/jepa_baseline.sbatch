@@ -23,6 +23,15 @@ module load python/3.11
 module load rocm/6.2.4
 
 cd "$PROJECT_DIR"
+
+# Pin to the GPUs Slurm allocated. Without AMD GPU isolation in gres.conf,
+# ROCR_VISIBLE_DEVICES is unset and every job would use physical GPUs 0..N-1,
+# colliding with other jobs on the node.
+if [ -z "${ROCR_VISIBLE_DEVICES:-}" ] && [ -n "${SLURM_JOB_GPUS:-}" ]; then
+  export ROCR_VISIBLE_DEVICES="$SLURM_JOB_GPUS"
+fi
+echo "[$(date -Is)] gpus: SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-unset} HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset}"
+rocm-smi --showmemuse --showpids 2>/dev/null || true
 export GRANDTOUR_ROOT="${GRANDTOUR_ROOT:-$STORAGE_ROOT/data/grandtour}"
 export QUADWM_CHECKPOINT_ROOT="${QUADWM_CHECKPOINT_ROOT:-$STORAGE_ROOT/checkpoints}"
 export QUADWM_CACHE_ROOT="${QUADWM_CACHE_ROOT:-$STORAGE_ROOT/cache/vjepa21}"

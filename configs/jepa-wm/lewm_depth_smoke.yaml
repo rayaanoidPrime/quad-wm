@@ -25,6 +25,8 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.05
   clip_grad_norm: 1.0
+  # Refuse to start if another process already holds more than half a GPU.
+  min_free_gpu_fraction: 0.5
   log_every_steps: 1
   eval_every_steps: 1
   eval_max_batches: 1

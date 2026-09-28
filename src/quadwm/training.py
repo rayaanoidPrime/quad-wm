@@ -35,16 +35,25 @@ from .models import (
 from .utils import init_wandb, run_metadata
 
 
-def _distributed() -> tuple[int, int, int, torch.device]:
+def _distributed(min_free_fraction: float) -> tuple[int, int, int, torch.device]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group("nccl")
     if not torch.cuda.is_available():
         raise RuntimeError("training requires an allocated CUDA/ROCm GPU")
-    torch.cuda.set_device(local_rank)
-    return rank, world_size, local_rank, torch.device("cuda", local_rank)
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group("nccl", device_id=device)
+    # Fail in seconds, not after cache building, when another process holds this GPU.
+    free, total = torch.cuda.mem_get_info(device)
+    print(f"stage=gpu rank={rank} device={local_rank} free_gib={free / 2**30:.1f} total_gib={total / 2**30:.1f}", flush=True)
+    if free < min_free_fraction * total:
+        raise RuntimeError(
+            f"GPU {local_rank} (rank {rank}) already has {(total - free) / 2**30:.1f} GiB in use by another "
+            "process; check ROCR_VISIBLE_DEVICES / other jobs on this node (rocm-smi --showpids)"
+        )
+    return rank, world_size, local_rank, device
 
 
 def _barrier() -> None:
@@ -338,7 +347,9 @@ def prepare(config: dict) -> Path | None:
 
 
 def train(config: dict) -> None:
-    rank, world_size, local_rank, device = _distributed()
+    rank, world_size, local_rank, device = _distributed(
+        float(config["training"].get("min_free_gpu_fraction", 0.5))
+    )
     _seed(int(config.get("seed", 4551)), rank)
     if rank == 0:
         print(
