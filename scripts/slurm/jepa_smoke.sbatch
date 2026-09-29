@@ -23,12 +23,22 @@ module load rocm/6.2.4
 
 cd "$PROJECT_DIR"
 
-# Pin to the GPUs Slurm allocated. Without AMD GPU isolation in gres.conf,
-# ROCR_VISIBLE_DEVICES is unset and every job would use physical GPUs 0..N-1,
-# colliding with other jobs on the node.
-if [ -z "${ROCR_VISIBLE_DEVICES:-}" ] && [ -n "${SLURM_JOB_GPUS:-}" ]; then
-  export ROCR_VISIBLE_DEVICES="$SLURM_JOB_GPUS"
-fi
+# The cluster's gres.conf maps the 8 XCD partitions of physical GPU 0 as
+# "GPUs", so SLURM_JOB_GPUS is not a usable physical GPU index; Slurm's device
+# isolation also hides physical GPU 0 from what the job's runtime can open.
+# Pick the freest GPU(s) the job can actually see, instead of trusting the
+# allocation. Clear the visibility vars first so the runtime enumerates them all.
+unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+export ROCR_VISIBLE_DEVICES="$(
+  GPUS="${SLURM_GPUS_ON_NODE:-1}" "$PROJECT_DIR/.venv/bin/python3" - <<'PY'
+import os, torch
+want = int(os.environ.get("GPUS", "1"))
+ranked = sorted(range(torch.cuda.device_count()),
+                key=lambda i: torch.cuda.mem_get_info(i)[0], reverse=True)
+print(",".join(map(str, sorted(ranked[:want]))))
+PY
+)"
+unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 echo "[$(date -Is)] gpus: SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-unset} HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset}"
 rocm-smi --showmemuse --showpids 2>/dev/null || true
 

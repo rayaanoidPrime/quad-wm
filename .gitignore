@@ -38,10 +38,11 @@ NOTES.md
 MISSION.md
 RESOURCES.md
 assets
-docs
 learning-records
 lessons
-reference 
+reference
+docs/*
+!docs/adr/
 
 # slurm job artifacs 
 *.out
@@ -55,6 +56,6 @@ src/quadwm/data/__pycache__/
 !configs/data/
 !configs/data/**
 configs/data/__pycache__/
-docs/adr/
+!docs/adr/
 
 
