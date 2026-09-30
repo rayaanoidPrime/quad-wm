@@ -11,7 +11,7 @@ sim:
   backend: mujoco
   # STAND-IN: Menagerie ships ANYmal B/C, not D. Joint names and order match
   # GrandTour's ANYmal D; masses, link lengths and actuators do not.
-  mjcf: ${QUADWM_SIM_ASSETS:-/scratch/quad-wm/assets}/mujoco_menagerie/anybotics_anymal_c/anymal_c.xml
+  mjcf: ${QUADWM_SIM_ASSETS:-~/quad-wm-storage/assets}/mujoco_menagerie/anybotics_anymal_c/anymal_c.xml
   base_body: base
   # Same clock as configs/data/baseline.yaml: 5 Hz ticks of 10 x 50 Hz targets.
   tick_hz: 5

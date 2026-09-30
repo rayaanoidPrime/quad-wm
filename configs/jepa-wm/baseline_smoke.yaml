@@ -1,13 +1,13 @@
 name: jepa-baseline-smoke
 seed: 4551
 
-run_root: ${QUADWM_RUN_ROOT:-/scratch/quad-wm/runs}
-checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-/scratch/quad-wm/checkpoints}
+run_root: ${QUADWM_RUN_ROOT:-~/quad-wm-storage/runs}
+checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-~/quad-wm-storage/checkpoints}
 data_config: configs/data/grandtour_smoke.yaml
 
 cache:
   mode: auto
-  root: ${QUADWM_CACHE_ROOT:-/scratch/quad-wm/cache/vjepa21-smoke}
+  root: ${QUADWM_CACHE_ROOT:-~/quad-wm-storage/cache/vjepa21-smoke}
   batch_size: 4
 
 model:
