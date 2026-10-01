@@ -80,7 +80,7 @@ def load_checkpoint(
     return int(checkpoint.get("epoch", 0))
 
 
-def model_class(wm_config: dict) -> type[JEPAWorldModel] | type[LeWorldModel]:
+def model_class(wm_config: dict) -> type[JEPAWorldModel | LeWorldModel]:
     """The class ``build_model`` builds, for decisions made before the model exists (token cache, encoder)."""
     return LeWorldModel if wm_config.get("type") == "lewm" else JEPAWorldModel
 

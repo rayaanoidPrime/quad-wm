@@ -14,27 +14,26 @@ EV1-sim, EV2, EV3, EV4 and EV6 run in `quadwm sim-eval` (sim_protocol.py).
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
 from ..data import build_sequence_dataset
-from ..models import VJEPA21Encoder, build_model
-from ..tokens import build_token_cache, cache_fits, load_token_caches, model_inputs
+from ..tokens import TokenCache, build_token_cache, cache_fits, load_token_caches, model_inputs
 from ..utils import run_metadata
-from .metrics import (
-    evaluation_sigma,
-    gait_cycle_seconds,
-    r2_and_pearson,
-    rollout_errors,
-    select_anchor_windows,
+from .common import (
+    autocast,
+    collect_latents,
+    evaluate_probes,
+    load_model,
+    model_record,
+    open_checkpoint,
+    precision_dtype,
+    write_result,
 )
-from .probes import StateProbe, fit_probe
-from .rollout import protocol_latents
+from .metrics import gait_cycle_seconds, select_anchor_windows
 
 NOT_RUN = {
     "EV1_sim_EV2_EV3_EV4_EV6": "simulated evals run separately: `quadwm sim-eval` (docs/adr/0006); "
@@ -64,21 +63,17 @@ def _load_splits(run_root: Path, eval_config: dict) -> dict[str, list[str]]:
     return splits
 
 
-def _strip_encoder(state_dict: dict) -> dict:
-    """Runs trained without the token cache saved the frozen V-JEPA weights too; they are reloaded."""
-    return {key: value for key, value in state_dict.items() if not key.startswith("visual_encoder.")}
-
-
 def _window_dataset(data_cfg: dict, missions: list[str], eval_config: dict, *, observation: str,
-                    load_images: bool):
+                    load_images: bool, normalization: dict | None = None):
     data_root = Path(data_cfg.get("data_root", "data/grandtour"))
+    context_frames = int(eval_config["context_frames"])
     try:
         return build_sequence_dataset(
             data_cfg,
             observation=observation,
             platform=data_cfg["platform"],
             data_root=data_root,
-            context_steps=int(eval_config["context_frames"]),
+            context_steps=context_frames,
             rollout_steps=max(int(k) for k in eval_config["horizons"]),
             tick_hz=float(data_cfg["tick_hz"]),
             control_hz=float(data_cfg["control_hz"]),
@@ -86,6 +81,8 @@ def _window_dataset(data_cfg: dict, missions: list[str], eval_config: dict, *, o
             max_sequences=None,
             load_images=load_images,
             missions=missions,
+            normalization=normalization,
+            state_origin=context_frames - 1,  # base position relative to the rollout start
         )
     except KeyError as error:
         raise RuntimeError(
@@ -95,15 +92,17 @@ def _window_dataset(data_cfg: dict, missions: list[str], eval_config: dict, *, o
         ) from error
 
 
-def protocol_windows(data_cfg: dict, missions: list[str], eval_config: dict, *, load_images: bool):
+def protocol_windows(data_cfg: dict, missions: list[str], eval_config: dict, *, load_images: bool,
+                     normalization: dict | None = None):
     """Windows anchored on a shared time grid, matched across every compared observation."""
     own = data_cfg["observation"]
     context_frames = int(eval_config["context_frames"])
     windows_cfg = eval_config["windows"]
-    dataset = _window_dataset(data_cfg, missions, eval_config, observation=own, load_images=load_images)
+    dataset = _window_dataset(data_cfg, missions, eval_config, observation=own, load_images=load_images,
+                              normalization=normalization)
     others = [
         _window_dataset(data_cfg, missions, eval_config, observation=observation, load_images=False)
-        for observation in windows_cfg.get("match_observations", []) if observation != own
+        for observation in windows_cfg["match_observations"] if observation != own
     ]
 
     def anchors(source, reader_index: int) -> tuple[list[int], np.ndarray]:
@@ -122,68 +121,31 @@ def protocol_windows(data_cfg: dict, missions: list[str], eval_config: dict, *, 
             max_windows=int(windows_cfg["max_per_mission"]),
         )
         selected.extend(rows[i] for i in chosen)
-    dataset.index = [dataset.index[row] for row in selected]
-    dataset.state_origin = context_frames - 1  # base position relative to the rollout start
+    dataset.select(selected)
     if not len(dataset):
         raise ValueError(f"no protocol windows in missions {missions}")
     return dataset
 
 
-@torch.no_grad()
-def _collect(model, dataset, caches, *, use_cache: bool, eval_config: dict,
-             device: torch.device, precision: torch.dtype, rollout: bool) -> dict[str, torch.Tensor]:
-    loader = DataLoader(dataset, batch_size=int(eval_config["batch_size"]), shuffle=False,
-                        num_workers=int(eval_config.get("num_workers", 0)), pin_memory=True, drop_last=False)
-    context_frames = int(eval_config["context_frames"])
-    steps = max(int(k) for k in eval_config["horizons"]) if rollout else 0
-    parts: dict[str, list[torch.Tensor]] = {"encoded": [], "predicted": [], "states": [], "mission_idx": []}
-    for batch in loader:
-        moved, tokens = model_inputs(model, batch, device, caches if use_cache else None)
-        with torch.autocast(device_type=device.type, dtype=precision, enabled=device.type == "cuda"):
-            outputs = protocol_latents(model, moved, context_frames=context_frames, steps=steps,
-                                       visual_tokens=tokens)
-        parts["encoded"].append(outputs["encoded"].float().cpu())
-        if rollout:
-            parts["predicted"].append(outputs["predicted"].float().cpu())
-        parts["states"].append(batch["state"].float())
-        parts["mission_idx"].append(torch.as_tensor(batch["mission_idx"]))
-    return {key: torch.cat(values) for key, values in parts.items() if values}
+def _token_caches(model, datasets: dict, cache_cfg: dict, data_root: Path, device: torch.device
+                  ) -> dict[str, list[TokenCache | None] | None]:
+    """Per-split frozen-token caches (built on first use), or None per split to encode images instead.
 
-
-def _summary(errors: dict[str, torch.Tensor]) -> tuple[dict[str, float], dict[str, float]]:
-    return ({key: float(value.mean()) for key, value in errors.items()},
-            {key: float(value.std()) if len(value) > 1 else 0.0 for key, value in errors.items()})
-
-
-def _probe_results(kind: str, probe_set: dict, eval_set: dict, eval_config: dict, horizons: list[int],
-                   mission_names: list[str], device: torch.device) -> tuple[dict, StateProbe]:
-    context_frames = int(eval_config["context_frames"])
-    probe, fit = fit_probe(kind, probe_set["encoded"], probe_set["states"], eval_config["probe"],
-                           seed=int(eval_config.get("seed", 4551)), device=device)
-    states = eval_set["states"]
-    sigma = evaluation_sigma(states, float(eval_config.get("sigma_floor", 1e-3)))
-    decoded = probe(eval_set["encoded"])  # [N, T, 40]
-    predicted = probe(eval_set["predicted"])  # [N, K, 40]
-    quality = r2_and_pearson(decoded.reshape(-1, decoded.shape[-1]), states.reshape(-1, states.shape[-1]))
-    curve = {}
-    for k in horizons:
-        target = states[:, context_frames - 1 + k]
-        model_errors = rollout_errors(predicted[:, k - 1], target, sigma)
-        mean, std = _summary(model_errors)
-        per_mission = {
-            mission_names[int(index)]: float(model_errors["all"][eval_set["mission_idx"] == index].mean())
-            for index in eval_set["mission_idx"].unique()
-        }
-        curve[str(k)] = {
-            "model": mean,
-            "model_std_over_windows": std,
-            # Error if the predicted latent were exactly the encoded future: the probe's own floor.
-            "encoded_floor": _summary(rollout_errors(decoded[:, context_frames - 1 + k], target, sigma))[0],
-            # Probe of z_t held constant: the rollout must beat this.
-            "persistence": _summary(rollout_errors(decoded[:, context_frames - 1], target, sigma))[0],
-            "per_mission_all": per_mission,
-        }
-    return {"fit": fit, "quality": quality, "eps_k": curve, "sigma": sigma.tolist()}, probe
+    Same cache, settings, and keying as training, so eval reuses training's tokens.
+    """
+    if not model.frozen_visual_encoder or cache_cfg.get("mode", "auto") == "off":
+        return dict.fromkeys(datasets)
+    cache_root = Path(cache_cfg.get("root", data_root / "quadwm-token-cache"))
+    cache_root.mkdir(parents=True, exist_ok=True)
+    if not cache_fits(list(datasets.values()), cache_root, model.tokens_per_frame, model.visual_dim):
+        return dict.fromkeys(datasets)
+    caches = {}
+    for split, dataset in datasets.items():
+        build_token_cache(dataset, model.visual_encoder, cache_root, device, int(cache_cfg.get("batch_size", 16)),
+                          model.image_size)
+        dataset.load_images = False
+        caches[split] = load_token_caches(cache_root, dataset.readers, True)
+    return caches
 
 
 def _gait_cycle(readers, tick_hz: float, gait_cfg: dict) -> dict:
@@ -194,9 +156,9 @@ def _gait_cycle(readers, tick_hz: float, gait_cfg: dict) -> dict:
         for foot in range(4):
             periods += gait_cycle_seconds(
                 reader.proprio_timestamps, reader.proprio["contacts"][:, foot], speed,
-                min_speed=float(gait_cfg.get("min_speed", 0.2)),
-                min_segment_s=float(gait_cfg.get("min_segment_s", 4.0)),
-                period_range_s=tuple(gait_cfg.get("period_range_s", (0.3, 2.0))),
+                min_speed=float(gait_cfg["min_speed"]),
+                min_segment_s=float(gait_cfg["min_segment_s"]),
+                period_range_s=tuple(gait_cfg["period_range_s"]),
             )
         if periods:
             per_mission[reader.mission_dir.name] = float(np.median(periods))
@@ -239,7 +201,6 @@ def _compute_parity(model, eval_config: dict, run_root: Path, device: torch.devi
     training_only = sum(p.numel() for head in model.training_only_modules() for p in head.parameters())
     encoder_params = sum(p.numel() for p in encoder.parameters()) if encoder is not None else 0
     own = sum(p.numel() for name, p in model.named_parameters() if not name.startswith("visual_encoder."))
-    autocast = torch.autocast(device_type=device.type, dtype=precision, enabled=device.type == "cuda")
     context = model.context_steps
     frames = torch.randn(batch, context, *model.frame_shape, device=device)
     actions = torch.randn(batch, context + steps - 1, model.action_dim, device=device)
@@ -248,11 +209,11 @@ def _compute_parity(model, eval_config: dict, run_root: Path, device: torch.devi
                    "proprio": torch.randn(1, 1, model.proprio_dim, device=device)}
 
     def rollout():
-        with autocast:
+        with autocast(device, precision):
             model.rollout(frames, actions, steps)
 
     def single():  # one new camera frame (through the frozen encoder, if any) -> one predicted frame
-        with autocast:
+        with autocast(device, precision):
             latest = model.encode_frames(*model_inputs(model, observation, device))
             model.rollout(torch.cat((frames[:1, 1:], latest), 1), actions[:1], 1)
 
@@ -297,117 +258,61 @@ def training_compute(run_root: Path, max_gap_s: float = 600.0) -> dict:
             "gpu_name": metadata.get("gpu_name"), "logged_steps": len(stamps)}
 
 
-def open_checkpoint(config: dict, checkpoint: Path | None, seed: int) -> tuple[Path, Path, dict, torch.device]:
-    """(run_root, checkpoint path, saved checkpoint, device), seeded; shared by real and sim evals."""
-    # Resolved exactly like training.train, so eval finds the same run directory.
-    run_root = Path(config.get("run_root", "runs")) / config.get("name", "jepa-baseline")
-    checkpoint = Path(checkpoint) if checkpoint else run_root / "last.pt"
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"checkpoint {checkpoint} not found")
-    device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
-    if device.type == "cpu":
-        print("stage=eval warning=no GPU; running on CPU (slow)", flush=True)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    normalization = saved["config"]["data"].get("normalization")
-    if saved["config"]["data"].get("normalize", True) and normalization is None:
-        raise ValueError("checkpoint predates docs/adr/0002 input normalization; retrain")
-    return run_root, checkpoint, saved, device
-
-
-def load_model(saved: dict, checkpoint_root: Path):
-    """The checkpoint's world model on CPU, with its frozen encoder (never trained, so reloaded) attached."""
-    model = build_model(saved["config"]["model"], checkpoint_root)
-    model.load_state_dict(_strip_encoder(saved["model"]))
-    if model.frozen_visual_encoder:
-        model.visual_encoder = VJEPA21Encoder(checkpoint_root)
-    return model
-
-
-def model_record(saved: dict, checkpoint: Path, model, latent_dim: int) -> dict:
-    trained = saved["config"]
-    return {
-        "name": trained.get("name"), "group": trained.get("wandb", {}).get("group", trained.get("name")),
-        "type": trained["model"].get("type", "jepa-baseline"), "seed": trained.get("seed"),
-        "checkpoint": str(checkpoint), "epoch": saved.get("epoch"), "latent_dim": latent_dim,
-        "context_steps": model.context_steps,
-    }
-
-
 def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None = None,
                         output: Path | None = None) -> dict:
-    seed = int(eval_config.get("seed", 4551))
+    seed = int(eval_config["seed"])
     run_root, checkpoint, saved, device = open_checkpoint(config, checkpoint, seed)
     trained = saved["config"]
     data_cfg = dict(config["data"])  # paths from this machine; transforms from the checkpoint
     data_cfg["observation"] = trained["data"]["observation"]
-    normalization = trained["data"].get("normalization")
     splits = _load_splits(run_root, eval_config)
     horizons = sorted(int(k) for k in eval_config["horizons"])
-    precision = torch.bfloat16 if eval_config.get("precision", "bf16") == "bf16" else torch.float16
+    context_frames = int(eval_config["context_frames"])
+    precision = precision_dtype(eval_config["precision"])
     print(f"stage=eval status=starting checkpoint={checkpoint} epoch={saved.get('epoch')} "
           f"device={device} horizons={horizons}", flush=True)
 
     model = load_model(saved, Path(config.get("checkpoint_root", "checkpoints"))).to(device).eval()
-    cache_cfg = config.get("cache", {})
-    use_cache = cache_cfg.get("mode", "auto") != "off" and model.frozen_visual_encoder
     datasets = {}
     for split in ("probe", "eval"):
-        datasets[split] = protocol_windows(data_cfg, splits[split], eval_config, load_images=True)
-        datasets[split].normalization = normalization
+        datasets[split] = protocol_windows(data_cfg, splits[split], eval_config, load_images=True,
+                                           normalization=trained["data"].get("normalization"))
         print(f"stage=eval_windows split={split} missions={len(datasets[split].readers)} "
               f"windows={len(datasets[split])}", flush=True)
-
-    caches = {"probe": [], "eval": []}
-    if use_cache:
-        cache_root = Path(cache_cfg.get("root", Path(data_cfg["data_root"]) / "quadwm-token-cache"))
-        cache_root.mkdir(parents=True, exist_ok=True)
-        use_cache = cache_fits(list(datasets.values()), cache_root, model.tokens_per_frame, model.visual_dim)
-    if use_cache:
-        for split, dataset in datasets.items():
-            build_token_cache(dataset, model.visual_encoder, cache_root, device,
-                              int(cache_cfg.get("batch_size", 16)), model.image_size)
-            dataset.load_images = False
-            caches[split] = load_token_caches(cache_root, dataset.readers, True)
-
+    caches = _token_caches(model, datasets, config.get("cache", {}), Path(data_cfg["data_root"]), device)
     collected = {
-        split: _collect(model, dataset, caches[split], use_cache=use_cache, eval_config=eval_config,
-                        device=device, precision=precision, rollout=split == "eval")
+        split: collect_latents(model, dataset, context_frames=context_frames,
+                               steps=max(horizons) if split == "eval" else 0,
+                               batch_size=int(eval_config["batch_size"]), num_workers=int(eval_config["num_workers"]),
+                               device=device, precision=precision, caches=caches[split])
         for split, dataset in datasets.items()
     }
     mission_names = [reader.mission_dir.name for reader in datasets["eval"].readers]
-    probes = {
-        kind: _probe_results(kind, collected["probe"], collected["eval"], eval_config, horizons,
-                             mission_names, device)[0]
-        for kind in eval_config["probe"]["kinds"]
-    }
+    probes = evaluate_probes(collected, eval_config, mission_names, device).results
     tick_hz = float(data_cfg["tick_hz"])
     result = {
         "protocol": "recipes/shared_evaluation_protocol.md",
-        "eval_config": eval_config.get("name"),
+        "eval_config": eval_config["name"],
         "domain": "real (GrandTour); eps_k here is protocol EV5",
         "model": model_record(saved, checkpoint, model, int(collected["eval"]["encoded"].shape[-1])),
         "data": {
             "observation": data_cfg["observation"], "tick_hz": tick_hz,
             "eval_missions": sorted(splits["eval"]), "probe_missions": sorted(splits["probe"]),
             "windows": {split: len(dataset) for split, dataset in datasets.items()},
-            "context_frames": int(eval_config["context_frames"]),
-            "match_observations": eval_config["windows"].get("match_observations", []),
+            "context_frames": context_frames,
+            "match_observations": eval_config["windows"]["match_observations"],
         },
         "horizons": horizons,
         "horizons_s": [k / tick_hz for k in horizons],
         "probes": probes,
         "gait_cycle": _gait_cycle(datasets["probe"].readers + datasets["eval"].readers, tick_hz,
-                                  eval_config.get("gait", {})),
+                                  eval_config["gait"]),
         "not_run": NOT_RUN,
         "metadata": run_metadata(config) | {"eval_seed": seed, "device": str(device)},
     }
-    if eval_config.get("compute", {}).get("enabled", True):
+    if eval_config["compute"]["enabled"]:
         result["compute"] = _compute_parity(model, eval_config, run_root, device, precision)
-    output = Path(output) if output else run_root / "eval" / f"{checkpoint.stem}-{eval_config.get('name', 'protocol')}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(_finite(result), indent=2) + "\n", encoding="utf-8")
+    output = write_result(result, output, run_root, checkpoint, eval_config["name"])
     for kind, values in probes.items():
         print(f"stage=eval probe={kind} r2_all={values['quality']['all']['r2']:.3f} "
               + " ".join(f"eps_{k}={values['eps_k'][str(k)]['model']['all']:.3f}"
@@ -415,14 +320,3 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
               flush=True)
     print(f"stage=eval status=complete output={output}", flush=True)
     return result
-
-
-def _finite(value):
-    """JSON has no NaN/inf; write them as null."""
-    if isinstance(value, dict):
-        return {key: _finite(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_finite(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value

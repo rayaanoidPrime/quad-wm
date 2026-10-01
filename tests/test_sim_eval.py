@@ -79,7 +79,7 @@ def test_locomotion_cost_prefers_tracking_and_upright():
     states[1, :, STATE_LAYOUT["lin_vel"].start] = 0.0
     states[2, :, STATE_LAYOUT["lin_vel"].start] = 0.4
     states[2, :, STATE_LAYOUT["gravity"]] = torch.tensor([0.7, 0.0, -0.7])  # tipping over
-    cost = locomotion_cost(states, 0.4, {})
+    cost = locomotion_cost(states, 0.4, {"velocity": 1.0, "upright": 1.0, "yaw_rate": 0.1})
     assert cost[0] < cost[1] and cost[0] < cost[2]
 
 
@@ -223,6 +223,7 @@ def test_sim_eval_pipeline_with_toy_simulator(tmp_path, monkeypatch):
 
 def test_report_pairs_real_and_sim_runs_for_delta_s2r(tmp_path, monkeypatch):
     from quadwm.evaluation import sim_protocol
+    from quadwm.evaluation.common import finite
     from quadwm.evaluation.report import build_report
 
     monkeypatch.setattr(sim_protocol, "build_simulator", _ToySim)
@@ -232,7 +233,7 @@ def test_report_pairs_real_and_sim_runs_for_delta_s2r(tmp_path, monkeypatch):
     real["domain"] = "real (GrandTour)"
     for curve in real["probes"]["mlp"]["eps_k"].values():
         curve["model"]["all"] += 1.0
-    text = build_report([json.loads(json.dumps(sim_protocol._finite(sim))), real])
+    text = build_report([json.loads(json.dumps(finite(sim))), real])
     assert "Δ_s2r" in text
     assert "1.000 (n=1)" in text.split("Δ_s2r")[-1]
 
@@ -251,3 +252,23 @@ def test_sim_eval_in_mujoco(tmp_path):
     result = evaluate_in_sim(config, sim_eval)
     assert {"ev2", "ev3", "ev4", "ev6"} <= set(result)
     assert result["data"]["windows"]["eval"] > 0
+
+
+def test_perturbed_replays_restore_rendering_even_on_failure():
+    from quadwm.evaluation.sim_protocol import _perturbed_replays
+
+    sim = _ToySim({"camera": {"modalities": ["depth"]}, "default_joint_pos": SIM_CONFIG["default_joint_pos"]})
+    cfg = {"command_mps": 0.3, "deltas_rad": [0.05], "repeats": 2}
+    replays = _perturbed_replays(sim, build_controller(SIM_CONFIG), cfg, TerrainSpec(), 0, warmup=2, steps=3,
+                                 rng=np.random.default_rng(0))
+    assert replays.sequences.shape == (3, 3, 120) and replays.states.shape == (3, 4, 40)
+    assert replays.deltas == [0.05, 0.05] and len(replays.actions) == 2 and sim.rendering
+
+    def broken(state):
+        raise RuntimeError("simulator died")
+
+    sim.set_state = broken
+    with pytest.raises(RuntimeError):
+        _perturbed_replays(sim, build_controller(SIM_CONFIG), cfg, TerrainSpec(), 0, warmup=2, steps=3,
+                           rng=np.random.default_rng(0))
+    assert sim.rendering, "a failed replay must not leave rendering off for the next eval"
