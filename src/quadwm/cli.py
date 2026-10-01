@@ -29,6 +29,16 @@ def main() -> None:
     eval_parser.add_argument("--eval-config", type=Path, default=Path("configs/eval/protocol.yaml"))
     eval_parser.add_argument("--checkpoint", type=Path, help="default: <run_root>/<name>/last.pt")
     eval_parser.add_argument("--output", type=Path, help="default: <run_root>/<name>/eval/<ckpt>-<eval name>.json")
+    sim_eval_parser = subparsers.add_parser(
+        "sim-eval", help="simulated protocol evals of a checkpoint: EV1-sim, EV2, EV3, EV4, EV6"
+    )
+    sim_eval_parser.add_argument("--config", type=Path, required=True, help="the run's training config")
+    sim_eval_parser.add_argument("--sim-eval-config", type=Path, default=Path("configs/eval/sim.yaml"))
+    sim_eval_parser.add_argument("--checkpoint", type=Path, help="default: <run_root>/<name>/last.pt")
+    sim_eval_parser.add_argument("--output", type=Path, help="default: <run_root>/<name>/eval/<ckpt>-<sim name>.json")
+    sim_eval_parser.add_argument("--only", help="comma-separated subset of ev1,ev2,ev3,ev4,ev6 (probes always fit)")
+    collect_parser = subparsers.add_parser("sim-collect", help="render and cache the EV1-sim episodes (CPU)")
+    collect_parser.add_argument("--sim-eval-config", type=Path, default=Path("configs/eval/sim.yaml"))
     report_parser = subparsers.add_parser("report", help="aggregate eval JSONs across seeds and models")
     report_parser.add_argument("evals", type=Path, nargs="+")
     report_parser.add_argument("--output", type=Path, help="write markdown here as well as stdout")
@@ -44,6 +54,19 @@ def main() -> None:
         from .evaluation.protocol import evaluate_checkpoint
 
         evaluate_checkpoint(load_config(args.config), load_config(args.eval_config), args.checkpoint, args.output)
+        return
+    if args.command == "sim-eval":
+        from .evaluation.sim_protocol import evaluate_in_sim
+
+        only = args.only.split(",") if args.only else None
+        evaluate_in_sim(load_config(args.config), load_config(args.sim_eval_config), args.checkpoint, args.output,
+                        only)
+        return
+    if args.command == "sim-collect":
+        from .evaluation.sim_protocol import collect_episodes
+
+        for split, paths in collect_episodes(load_config(args.sim_eval_config)).items():
+            print(f"stage=sim_collect split={split} episodes={len(paths)} folder={paths[0].parent}", flush=True)
         return
     if args.command == "report":
         from .evaluation import report

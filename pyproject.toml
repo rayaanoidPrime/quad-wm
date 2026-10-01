@@ -32,6 +32,8 @@ dev = [
 ]
 sim = [
   "mujoco>=3.0",
+  # Fetches MuJoCo Menagerie (ANYmal C MJCF) at a pinned commit on first use.
+  "robot_descriptions>=1.12",
 ]
 
 [tool.uv.sources]
@@ -56,6 +58,9 @@ packages = ["src/quadwm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "sim: needs MuJoCo (uv sync --extra sim) and the Menagerie ANYmal C MJCF under QUADWM_SIM_ASSETS; skipped otherwise",
+]
 
 [tool.ruff]
 line-length = 100

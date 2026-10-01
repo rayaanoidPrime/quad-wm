@@ -1,0 +1,82 @@
+# Simulated half of the shared protocol (docs/adr/0006): EV1-sim, EV2, EV3
+# (CEM planning), EV4, EV6, in MuJoCo with the scripted trot controller.
+# One file for every model compared; changing it changes the protocol, so
+# bump `name` and record why.
+name: sim-protocol-v1
+seed: 4551
+# Horizons, context, probe architecture/budget, sigma floor: identical to the
+# real-data eval so EV1-sim and EV5 share a probe procedure (for Δ_s2r).
+protocol_config: configs/eval/protocol.yaml
+sim_config: configs/sim/mujoco_anymal.yaml
+num_workers: 0                 # episodes are in memory; workers would copy them
+
+controller:                    # sim/controller.py, tuned on flat ground at kp=300
+  frequency_hz: 1.5
+  knee_lift: 0.7
+  speed_per_stride: 1.6
+  max_stride: 0.6
+  heading_gain: 3.0
+
+episodes:                      # EV1-sim trajectories, rendered once and cached for every model
+  cache_root: ${QUADWM_SIM_CACHE_ROOT:-~/quad-wm-storage/cache/sim-episodes}
+  ticks: 120                   # 24 s at 5 Hz; windows need 7 + 50 fall-free ticks
+  terrains: [[flat, 0.0], [rough, 0.03], [slope, 10.0], [stairs, 0.1]]
+  probe_seeds: [0, 1, 2, 3, 4, 5, 6, 7]
+  eval_seeds: [100, 101, 102, 103]
+  command_mps: [0.15, 0.5]     # per-episode command, uniform in this range
+  heading_change_rad: 0.4      # one commanded turn halfway through
+  action_noise_rad: 0.03       # recipe: action noise for coverage
+  window_stride_ticks: 10
+
+planning:                      # EV3 CEM (protocol §4.2: 300 candidates, 30 elites, 10 iterations)
+  probe: mlp                   # frozen sim probe that scores predicted latents
+  horizon_ticks: 6             # baseline recipe H = 6
+  population: 300
+  elites: 30
+  iterations: 10
+  init_std: 0.1                # rad, per-joint residual on top of the controller
+  min_std: 0.01
+  max_residual_rad: 0.3
+  residual_weight: 0.1
+  cost: {velocity: 1.0, upright: 1.0, yaw_rate: 0.1}
+  seed: 4551
+
+control_episode:               # shared by EV3, EV4, EV6 (planning and controller-only arms)
+  ticks: 100
+  warmup_ticks: 8              # >= every model's context_steps; controller only
+  command_mps: 0.4
+  success_m: 6.0               # forward distance that counts as traversal
+
+ev2:                           # protocol §3
+  terrains: [[flat, 0.0], [rough, 0.03]]
+  seeds: [200, 201, 202, 203]
+  warmup_ticks: 10
+  command_mps: 0.3
+  deltas_rad: [0.02, 0.05, 0.1]   # small / medium / large vs the ~0.5 rad hip sweep
+  repeats: 4
+  seed: 4551
+
+ev3:                           # protocol §4.3 terrain suite
+  seeds: [0, 1, 2]
+  max_level_success: 0.5
+  tiers:
+    - {name: "1-flat", kind: flat, levels: [0.0], metric: tracking}
+    - {name: "2-rough", kind: rough, levels: [0.02, 0.04], metric: tracking}
+    - {name: "3-slopes", kind: slope, levels: [10.0, 20.0, 25.0], metric: success}
+    - {name: "4-stairs", kind: stairs, levels: [0.05, 0.1, 0.15], metric: success}
+    - {name: "5-gaps", kind: gaps, levels: [0.1, 0.2, 0.3], metric: max_level}
+    - {name: "6-steps", kind: steps, levels: [0.1, 0.2, 0.3], metric: max_level}
+
+ev4:                           # protocol §5 grid, on EV3 planning
+  terrain: [rough, 0.02]
+  seeds: [0, 1, 2]
+  mass_percent: [-30, -15, 15, 30]
+  friction_scale: [0.4, 1.5, 2.5]
+  latency_ms: [10, 25, 50]
+  compound:
+    - {mass_percent: 30, friction_scale: 2.5, latency_ms: 50}
+    - {mass_percent: -30, friction_scale: 2.5, latency_ms: 50}
+
+ev6:                           # protocol §7, unilateral_steps original vs mirrored
+  level: 0.1
+  seeds: [0, 1, 2]

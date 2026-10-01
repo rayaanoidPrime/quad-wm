@@ -21,7 +21,8 @@ class SimulatorUnavailable(RuntimeError):
 class TerrainSpec:
     """One tier of the shared terrain suite (protocol §4.3).
 
-    ``kind`` is one of flat | rough | slope | stairs | gaps | steps; ``level``
+    ``kind`` is one of flat | rough | slope | stairs | gaps | steps |
+    unilateral_steps (EV6, left side only); ``level``
     is the tier's difficulty in natural units: rough amplitude (m), slope
     angle (deg), stair/step height (m), or gap width (m).
     """

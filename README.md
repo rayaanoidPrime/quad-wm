@@ -88,7 +88,7 @@ probes fit on the probe-fit missions, probe R² / Pearson r, EV5 ε_k at
 k ∈ {1, 5, 12, 25, 50} with per-component breakdown, persistence and
 probe-floor references, the measured gait cycle, and EV7 compute/latency.
 It writes `<run_root>/<name>/eval/<ckpt>-<eval name>.json`. The simulated
-evals (EV1-sim, EV2, EV3, EV4, EV6) are a separate command.
+evals run separately (below).
 
 Every model compared must use the same `configs/eval/protocol.yaml`, and
 both camera topics must be materialized under `GRANDTOUR_ROOT`: windows are
@@ -103,6 +103,27 @@ CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth   
 # Aggregate across seeds and models (mean ± std, Mann-Whitney U + Holm).
 uv run quadwm report $STORAGE_ROOT/runs/*/*/eval/last-*.json --output report.md
 ```
+
+### Simulated evals (EV1-sim, Δ_s2r, EV2, EV3, EV4, EV6)
+
+`quadwm sim-eval` runs the rest of the protocol in MuJoCo with a scripted trot
+controller (docs/adr/0006): EV1-sim with the same probe procedure, EV2
+action sensitivity from simulator replays, EV3 CEM planning over the terrain
+suite next to the controller alone, EV4 dynamics-shift retention, and EV6
+mirrored terrain. Models are trained on GrandTour only, so this is zero-shot
+transfer to a stand-in ANYmal C; read the limits in the ADR before quoting it.
+
+```bash
+# Once: MuJoCo + robot_descriptions. The ANYmal C MJCF (MuJoCo Menagerie, pinned
+# commit, ~2 GB) is fetched into $QUADWM_SIM_ASSETS on first use.
+uv sync --extra sim
+# Optional, CPU node: render the shared EV1-sim episodes ahead of time.
+uv run --extra sim quadwm sim-collect
+# Per model; ONLY=ev3 etc. splits the work.
+CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth   sbatch scripts/slurm/jepa_sim_eval.sbatch
+```
+
+Pass real and sim JSONs together to `quadwm report` to get Δ_s2r(k).
 
 `quadwm report` flags runs whose eval config, horizons, windows, or mission
 splits differ; protocol §11 needs at least 3 seeds per model

@@ -33,13 +33,44 @@ def _camera_quat(pitch_deg: float) -> list[float]:
     return [w, x, y, z]
 
 
+def resolve_mjcf(config: dict) -> Path:
+    """The robot MJCF, fetched on first use through ``robot_descriptions`` when missing.
+
+    ``robot_descriptions`` (in the ``sim`` extra) clones MuJoCo Menagerie at
+    a pinned commit into ``$ROBOT_DESCRIPTIONS_CACHE/mujoco_menagerie``. The
+    cache is pointed at the folder above ``mujoco_menagerie`` in the
+    configured path, so the fetched file lands exactly at ``config["mjcf"]``.
+    """
+    mjcf = Path(config["mjcf"]).expanduser()
+    if mjcf.is_file():
+        return mjcf
+    description = config.get("mjcf_description")
+    parents = [parent for parent in mjcf.parents if parent.name == "mujoco_menagerie"]
+    if description and parents:
+        import importlib
+        import os
+
+        os.environ.setdefault("ROBOT_DESCRIPTIONS_CACHE", str(parents[0].parent))
+        try:
+            fetched = Path(importlib.import_module(f"robot_descriptions.{description}").MJCF_PATH)
+        except ImportError as exc:
+            raise SimulatorUnavailable(
+                f"robot MJCF not found at {mjcf} and robot_descriptions is not installed (uv sync --extra sim)"
+            ) from exc
+        if fetched.resolve() != mjcf.resolve():
+            raise SimulatorUnavailable(
+                f"robot_descriptions put the MJCF at {fetched}, not {mjcf}; ROBOT_DESCRIPTIONS_CACHE is set to "
+                f"{os.environ['ROBOT_DESCRIPTIONS_CACHE']}. Unset it or point mjcf at the fetched file."
+            )
+        return mjcf
+    raise SimulatorUnavailable(f"robot MJCF not found at {mjcf}; see configs/sim/ for setup")
+
+
 class MujocoSimulator:
     def __init__(self, config: dict):
         if mujoco is None:
             raise SimulatorUnavailable(f"mujoco is not installed (uv sync --extra sim): {_IMPORT_ERROR}")
-        mjcf = Path(config["mjcf"])
-        if not mjcf.is_file():
-            raise SimulatorUnavailable(f"robot MJCF not found at {mjcf}; see configs/sim/ for setup")
+        mjcf = resolve_mjcf(config)
         self.config = config
         self.tick_hz = float(config["tick_hz"])
         self.control_hz = float(config["control_hz"])
@@ -47,6 +78,8 @@ class MujocoSimulator:
         self.default_pose = np.asarray(config["default_joint_pos"], dtype=np.float64)
         self._base_spec = mujoco.MjSpec.from_file(str(mjcf))
         self.model = self.data = self.renderer = None
+        # Off for state-only replays (EV2), where camera frames are never used.
+        self.rendering = True
 
     # -- episode setup -------------------------------------------------------
 
@@ -163,7 +196,7 @@ class MujocoSimulator:
             [state[key] for key in ("lin_vel", "ang_vel", "gravity", "joint_pos", "joint_vel")]
         )
         state |= self._privileged()
-        if self.renderer is not None:
+        if self.renderer is not None and self.rendering:
             self.renderer.update_scene(data, camera="front")
             modalities = self.config["camera"]["modalities"]
             if "rgb" in modalities:

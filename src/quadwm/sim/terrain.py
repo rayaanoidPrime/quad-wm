@@ -12,6 +12,8 @@ def terrain_heights(
 ) -> np.ndarray:
     """[rows(y), cols(x)] heights in meters; the robot starts at x=-length/2 and walks +x.
 
+    Row 0 is y = -width/2 (the robot's right); ``mirrored`` flips left/right.
+
     The first 2 m are always flat so every episode starts from the same
     footing regardless of tier.
     """
@@ -32,13 +34,17 @@ def terrain_heights(
         profile = np.where((course > 0) & (course % period > 1.0), -1.0, 0.0)
     elif spec.kind == "steps":  # a single climb onto a raised platform
         profile = np.where(course > 1.0, spec.level, 0.0)
-    elif spec.kind == "rough":
+    elif spec.kind in ("rough", "unilateral_steps"):
         profile = np.zeros_like(x)
     else:
         raise ValueError(f"unknown terrain kind {spec.kind!r}")
     heights = np.tile(profile, (rows, 1))
     if spec.kind == "rough":
         heights += rng.uniform(-spec.level, spec.level, heights.shape) * (course > 0)
+    if spec.kind == "unilateral_steps":  # EV6: blocks of height `level` under the left feet only
+        y = (np.arange(rows) + 0.5) * cell_m - width_m / 2
+        blocks = (course > 0) & (course % 1.0 < 0.5)
+        heights += spec.level * np.outer((y > 0) & (y < 0.6), blocks)
     if spec.mirrored:
         heights = heights[::-1]
     return heights

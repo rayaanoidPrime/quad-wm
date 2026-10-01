@@ -1,6 +1,5 @@
-# MuJoCo ANYmal simulator (docs/adr/0003). Assets live outside Git:
-#   git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie \
-#     "$QUADWM_SIM_ASSETS/mujoco_menagerie"
+# MuJoCo ANYmal simulator (docs/adr/0003). Assets live outside Git and are
+# fetched on first use (`uv sync --extra sim` installs robot_descriptions).
 # Headless nodes: export MUJOCO_GL=egl.
 name: sim-smoke
 seed: 0
@@ -12,12 +11,17 @@ sim:
   # STAND-IN: Menagerie ships ANYmal B/C, not D. Joint names and order match
   # GrandTour's ANYmal D; masses, link lengths and actuators do not.
   mjcf: ${QUADWM_SIM_ASSETS:-~/quad-wm-storage/assets}/mujoco_menagerie/anybotics_anymal_c/anymal_c.xml
+  # If the file is missing, robot_descriptions (sim extra) fetches Menagerie
+  # at its pinned commit into $QUADWM_SIM_ASSETS/mujoco_menagerie (~2 GB, once).
+  mjcf_description: anymal_c_mj_description
   base_body: base
   # Same clock as configs/data/baseline.yaml: 5 Hz ticks of 10 x 50 Hz targets.
   tick_hz: 5
   control_hz: 50
-  kp: 100.0
-  kd: 2.0
+  # Stiffer than Menagerie's kp=100 so the scripted trot (sim/controller.py)
+  # holds a ~0.47 m base height and walks; docs/adr/0006.
+  kp: 300.0
+  kd: 8.0
   spawn_height: 0.62
   # JOINT_ORDER; the ANYmal standing pose used by Isaac Lab's ANYmal configs.
   default_joint_pos: [0.0, 0.4, -0.8, 0.0, 0.4, -0.8, 0.0, -0.4, 0.8, 0.0, -0.4, 0.8]

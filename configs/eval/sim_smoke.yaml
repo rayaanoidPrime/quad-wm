@@ -1,0 +1,40 @@
+# Tiny sim eval for smoke runs and tests: every code path, meaningless numbers.
+name: sim-smoke
+seed: 4551
+protocol_config: configs/eval/smoke.yaml
+sim_config: configs/sim/mujoco_anymal.yaml
+num_workers: 0
+controller: {frequency_hz: 1.5, knee_lift: 0.7, speed_per_stride: 1.6, max_stride: 0.6, heading_gain: 3.0}
+episodes:
+  cache_root: ${QUADWM_SIM_CACHE_ROOT:-~/quad-wm-storage/cache/sim-episodes}
+  ticks: 12
+  terrains: [[flat, 0.0]]
+  probe_seeds: [0]
+  eval_seeds: [100]
+  command_mps: [0.3, 0.3]
+  heading_change_rad: 0.0
+  action_noise_rad: 0.02
+  window_stride_ticks: 4
+planning:
+  probe: mlp
+  horizon_ticks: 2
+  population: 8
+  elites: 2
+  iterations: 2
+  init_std: 0.1
+  min_std: 0.01
+  max_residual_rad: 0.3
+  residual_weight: 0.1
+  cost: {velocity: 1.0, upright: 1.0, yaw_rate: 0.1}
+  seed: 0
+control_episode: {ticks: 6, warmup_ticks: 2, command_mps: 0.3, success_m: 6.0}
+ev2: {terrains: [[flat, 0.0]], seeds: [200], warmup_ticks: 2, command_mps: 0.3, deltas_rad: [0.05], repeats: 1, seed: 0}
+ev3:
+  seeds: [0]
+  max_level_success: 0.5
+  tiers:
+    - {name: "1-flat", kind: flat, levels: [0.0], metric: tracking}
+    - {name: "5-gaps", kind: gaps, levels: [0.1], metric: max_level}
+ev4: {terrain: [flat, 0.0], seeds: [0], mass_percent: [30], friction_scale: [], latency_ms: [],
+      compound: [{mass_percent: 30, friction_scale: 2.5, latency_ms: 50}]}
+ev6: {level: 0.1, seeds: [0]}
