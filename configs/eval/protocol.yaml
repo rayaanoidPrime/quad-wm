@@ -1,0 +1,49 @@
+# Shared evaluation protocol on GrandTour real data (docs/adr/0005):
+# probe quality, EV5 eps_k (the EV1 metric on real logs), EV7 compute.
+# One file for every model compared: probe architecture, optimizer, budget,
+# windows and horizons must be identical across models (protocol §1.3).
+# Changing anything here changes the protocol: bump `name` and record why.
+name: protocol-v1
+seed: 4551
+
+# Protocol §2, in model ticks (5 Hz: 0.2, 1, 2.4, 5, 10 s). k=12 is the
+# protocol's gait-cycle placeholder; `quadwm eval` reports the measured
+# ANYmal D gait cycle so it can be replaced by a deliberate, versioned edit.
+horizons: [1, 5, 12, 25, 50]
+# Context frames in every window; must be >= each compared model's
+# context_steps (baseline 7, LeWM 4). The last one is the rollout start t,
+# so all models predict the same future frames from the same t.
+context_frames: 7
+
+windows:
+  anchor_stride_s: 5.0       # one rollout start every 5 s of mission time
+  anchor_tolerance_s: 0.1    # half a 5 Hz tick
+  max_per_mission: 64        # evenly thinned, so every mission counts equally-ish
+  # Keep only anchors valid for every listed camera, so the RGB baseline and
+  # the depth LeWM are scored on the same moments (protocol §1.3 rule 5).
+  # Needs both topics materialized under GRANDTOUR_ROOT.
+  match_observations: [rgb_plus_proprioception, depth_plus_proprioception]
+
+batch_size: 8
+num_workers: 8
+precision: bf16
+sigma_floor: 0.001           # a component with ~0 eval-set std would otherwise divide by 0
+
+probe:                       # protocol §1.2: linear, and MLP 2 x 256 GELU
+  kinds: [linear, mlp]
+  hidden_dim: 256
+  steps: 4000                # fixed budget, no early stopping (no 4th split to select on)
+  batch_size: 1024
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+gait:
+  min_speed: 0.2             # m/s planar; standing segments carry no gait period
+  min_segment_s: 4.0
+  period_range_s: [0.3, 2.0]
+
+compute:                     # EV7, timed on random inputs of the real shapes
+  enabled: true
+  batch_size: 8
+  warmup: 5
+  repeats: 20

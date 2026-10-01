@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from quadwm.training import prepare, train as train_world_model
@@ -21,6 +22,16 @@ def main() -> None:
     train_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/baseline.yaml"))
     prepare_parser = subparsers.add_parser("prepare", help="download the local encoder checkpoint and data")
     prepare_parser.add_argument("--config", type=Path, default=Path("configs/jepa-wm/baseline.yaml"))
+    eval_parser = subparsers.add_parser(
+        "eval", help="shared-protocol eval of a trained checkpoint (probes, EV5 eps_k, EV7)"
+    )
+    eval_parser.add_argument("--config", type=Path, required=True, help="the run's training config")
+    eval_parser.add_argument("--eval-config", type=Path, default=Path("configs/eval/protocol.yaml"))
+    eval_parser.add_argument("--checkpoint", type=Path, help="default: <run_root>/<name>/last.pt")
+    eval_parser.add_argument("--output", type=Path, help="default: <run_root>/<name>/eval/<ckpt>-<eval name>.json")
+    report_parser = subparsers.add_parser("report", help="aggregate eval JSONs across seeds and models")
+    report_parser.add_argument("evals", type=Path, nargs="+")
+    report_parser.add_argument("--output", type=Path, help="write markdown here as well as stdout")
     sim_parser = subparsers.add_parser("sim-smoke", help="E1.0 simulator gate: stand, render, measure FPS")
     sim_parser.add_argument("--config", type=Path, default=Path("configs/sim/mujoco_anymal.yaml"))
     args = parser.parse_args()
@@ -29,9 +40,28 @@ def main() -> None:
 
         smoke(load_config(args.config))
         return
+    if args.command == "eval":
+        from .evaluation.protocol import evaluate_checkpoint
+
+        evaluate_checkpoint(load_config(args.config), load_config(args.eval_config), args.checkpoint, args.output)
+        return
+    if args.command == "report":
+        from .evaluation import report
+
+        text = report(args.evals, args.output)
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")  # ε, σ, ± on consoles that default to cp1252
+        print(text, end="")
+        return
     if args.command in ("smoke", "train"):
         # smoke is the same pipeline as train, just the tiny smoke config -- it
-        # exercises download/data/cache/encoder/train/eval before a full run.
-        train_world_model(load_config(args.config))
+        # exercises download/data/cache/encoder/train/eval before a full run,
+        # then the protocol eval on the checkpoint it just wrote.
+        config = load_config(args.config)
+        train_world_model(config)
+        if args.command == "smoke":
+            from .evaluation.protocol import evaluate_checkpoint
+
+            evaluate_checkpoint(config, load_config(Path("configs/eval/smoke.yaml")))
     elif args.command == "prepare":
         prepare(load_config(args.config))

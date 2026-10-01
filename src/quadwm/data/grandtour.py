@@ -103,16 +103,18 @@ def project_gravity(quat_xyzw: np.ndarray) -> np.ndarray:
     return rot.inv().apply(_GRAVITY_WORLD)
 
 
-def state_vectors(states: list[dict]) -> np.ndarray:
+def state_vectors(states: list[dict], origin_tick: int = 0) -> np.ndarray:
     """[T, 40] probe targets for one window (layout: STATE_LAYOUT).
 
     Absolute odometry position is not predictable from egocentric input, so
-    base position is expressed relative to the window's first tick, rotated
-    into that tick's yaw-aligned frame (docs/adr/0002).
+    base position is expressed relative to ``origin_tick`` (default: the
+    window's first tick), rotated into that tick's yaw-aligned frame
+    (docs/adr/0002). The protocol eval anchors it at the rollout start
+    (docs/adr/0005).
     """
-    yaw = Rotation.from_quat(states[0]["orientation"]).as_euler("zyx")[0]
+    yaw = Rotation.from_quat(states[origin_tick]["orientation"]).as_euler("zyx")[0]
     to_start = Rotation.from_euler("z", -yaw)
-    origin = states[0]["pose_pos"]
+    origin = states[origin_tick]["pose_pos"]
     return np.stack([
         np.concatenate((
             to_start.apply(state["pose_pos"] - origin), state["lin_vel"], state["ang_vel"],
@@ -651,6 +653,8 @@ class GrandTourSequenceDataset(Dataset):
         self.load_images = load_images
         # Set from training-split statistics (normalization_stats) by the caller.
         self.normalization: dict[str, list[float]] | None = None
+        # Tick that base position in ``state`` is relative to (state_vectors).
+        self.state_origin = 0
         self.index: list[tuple[int, tuple[int, ...]]] = []
         dropped = candidates = 0
         for reader_index, reader in enumerate(readers):
@@ -726,7 +730,7 @@ class GrandTourSequenceDataset(Dataset):
         output = {
             "proprio": torch.from_numpy(proprio).float(),
             "actions": torch.from_numpy(actions).float(),
-            "state": torch.from_numpy(state_vectors(states)),  # raw units, never normalized here
+            "state": torch.from_numpy(state_vectors(states, self.state_origin)),  # raw units, never normalized here
             "mission_idx": reader_index,
             "image_ids": torch.tensor(image_ids, dtype=torch.long),
         }

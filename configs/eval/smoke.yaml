@@ -1,0 +1,34 @@
+# Tiny protocol eval for `quadwm smoke`: exercises every code path of
+# `quadwm eval`, numbers are meaningless. Never use for results.
+name: smoke
+seed: 4551
+horizons: [1, 2]
+context_frames: 2
+# Smoke trains with one mission and no probe split; reuse eval missions for
+# probe fitting. Violates protocol §1.3 rule 4 -- smoke only.
+probe_split_fallback: eval
+windows:
+  anchor_stride_s: 5.0
+  anchor_tolerance_s: 0.1
+  max_per_mission: 2
+  match_observations: []     # only the run's own camera is downloaded for smoke
+batch_size: 2
+num_workers: 0
+precision: bf16
+sigma_floor: 0.001
+probe:
+  kinds: [linear, mlp]
+  hidden_dim: 256
+  steps: 5
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+gait:
+  min_speed: 0.2
+  min_segment_s: 4.0
+  period_range_s: [0.3, 2.0]
+compute:
+  enabled: true
+  batch_size: 1
+  warmup: 1
+  repeats: 2

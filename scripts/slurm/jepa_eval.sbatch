@@ -1,21 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=quadwm-jepa-smoke
-#SBATCH --output=logs/jepa-smoke-%j.out
-#SBATCH --error=logs/jepa-smoke-%j.err
-#SBATCH --time=00:10:00
+#SBATCH --job-name=quadwm-eval
+#SBATCH --output=logs/eval-%j.out
+#SBATCH --error=logs/eval-%j.err
+#SBATCH --time=06:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
 #SBATCH --gres=gpu:1
 
 set -euo pipefail
 
-# Override these at submission time when the cluster checkout differs.
 PROJECT_DIR="${PROJECT_DIR:-$HOME/quad-wm}"
 PROJECT_PARENT="$(dirname "$PROJECT_DIR")"
 STORAGE_ROOT="${QUADWM_STORAGE_ROOT:-$PROJECT_PARENT/quad-wm-storage}"
-RUN_ROOT="${RUN_ROOT:-${QUADWM_RUN_ROOT:-$STORAGE_ROOT/runs/smoke-$SLURM_JOB_ID}}"
-CONFIG="${CONFIG:-configs/jepa-wm/baseline_smoke.yaml}"
+# Same RUN_ROOT and CONFIG the run trained with, so the eval finds its
+# last.pt, splits.json and normalization. Example:
+#   CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth sbatch scripts/slurm/jepa_eval.sbatch
+RUN_ROOT="${RUN_ROOT:-${QUADWM_RUN_ROOT:-$STORAGE_ROOT/runs/jepa-baseline}}"
+CONFIG="${CONFIG:-configs/jepa-wm/baseline.yaml}"
+EVAL_CONFIG="${EVAL_CONFIG:-configs/eval/protocol.yaml}"
 
 module purge
 module load python/3.11
@@ -41,28 +44,20 @@ PY
 unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 echo "[$(date -Is)] gpus: SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-unset} HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset}"
 rocm-smi --showmemuse --showpids 2>/dev/null || true
-
 export GRANDTOUR_ROOT="${GRANDTOUR_ROOT:-$STORAGE_ROOT/data/grandtour}"
-export QUADWM_RUN_ROOT="$RUN_ROOT"
 export QUADWM_CHECKPOINT_ROOT="${QUADWM_CHECKPOINT_ROOT:-$STORAGE_ROOT/checkpoints}"
-export QUADWM_CACHE_ROOT="${QUADWM_CACHE_ROOT:-$STORAGE_ROOT/cache/vjepa21-smoke}"
+export QUADWM_CACHE_ROOT="${QUADWM_CACHE_ROOT:-$STORAGE_ROOT/cache/vjepa21}"
+export QUADWM_RUN_ROOT="$RUN_ROOT"
 mkdir -p logs "$GRANDTOUR_ROOT" "$QUADWM_CHECKPOINT_ROOT" "$QUADWM_CACHE_ROOT" "$RUN_ROOT"
 export QUADWM_GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 log() { echo "[$(date -Is)] $*"; }
 
 log "stage=job status=started id=$SLURM_JOB_ID host=$(hostname)"
-log "project=$PROJECT_DIR config=$CONFIG"
-log "grandtour_root=$GRANDTOUR_ROOT run_root=$QUADWM_RUN_ROOT"
-log "git_commit=$QUADWM_GIT_COMMIT"
+log "config=$CONFIG eval_config=$EVAL_CONFIG checkpoint=${CHECKPOINT:-<run>/last.pt}"
+log "grandtour_root=$GRANDTOUR_ROOT run_root=$RUN_ROOT git_commit=$QUADWM_GIT_COMMIT"
 
-log "stage=prepare status=starting"
-uv run quadwm prepare --config "$CONFIG"
-log "stage=prepare status=complete"
-log "stage=train status=starting"
-uv run torchrun --standalone --nproc_per_node=1 -m quadwm train --config "$CONFIG"
-log "stage=train status=complete"
 log "stage=eval status=starting"
-uv run quadwm eval --config "$CONFIG" --eval-config configs/eval/smoke.yaml
+uv run quadwm eval --config "$CONFIG" --eval-config "$EVAL_CONFIG" ${CHECKPOINT:+--checkpoint "$CHECKPOINT"}
 log "stage=eval status=complete"
 log "stage=job status=complete"

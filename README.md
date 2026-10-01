@@ -24,7 +24,7 @@ The first simulator gate is a headless MuJoCo physics/rendering smoke test on th
 
 ## First smoke test
 
-`quadwm smoke` runs the *entire* pipeline on the tiny smoke config -- download, data sync, token cache, V-JEPA encoder, one training step, checkpoint save, and a held-out eval pass. It is the same `train` code path, so configuration, data, and eval errors surface before a full training run. It needs an allocated GPU and materialized GrandTour data; the CPU-only check is the unit-test suite.
+`quadwm smoke` runs the *entire* pipeline on the tiny smoke config -- download, data sync, token cache, V-JEPA encoder, one training step, checkpoint save, a held-out eval pass, and the protocol eval (`configs/eval/smoke.yaml`) on the checkpoint it just wrote. It is the same `train` code path, so configuration, data, and eval errors surface before a full training run. It needs an allocated GPU and materialized GrandTour data; the CPU-only check is the unit-test suite.
 
 ```bash
 uv run quadwm smoke            # == quadwm train --config configs/jepa-wm/baseline_smoke.yaml
@@ -79,6 +79,34 @@ sbatch --gres=gpu:3 \
 The encoder checkpoint and feature cache live under the configured external
 roots. `uv run quadwm prepare --config configs/jepa-wm/baseline.yaml` can be run
 interactively first; it is idempotent.
+
+## Evaluate trained runs (shared protocol)
+
+`quadwm eval` scores one checkpoint under `recipes/shared_evaluation_protocol.md`
+on the run's own held-out missions (docs/adr/0005): linear and MLP state
+probes fit on the probe-fit missions, probe R² / Pearson r, EV5 ε_k at
+k ∈ {1, 5, 12, 25, 50} with per-component breakdown, persistence and
+probe-floor references, the measured gait cycle, and EV7 compute/latency.
+It writes `<run_root>/<name>/eval/<ckpt>-<eval name>.json`. The simulated
+evals (EV1-sim, EV2, EV3, EV4, EV6) are a separate command.
+
+Every model compared must use the same `configs/eval/protocol.yaml`, and
+both camera topics must be materialized under `GRANDTOUR_ROOT`: windows are
+anchored on moments valid for the RGB *and* depth camera so both recipes are
+scored on the same data.
+
+```bash
+# Use the CONFIG and RUN_ROOT the run trained with.
+CONFIG=configs/jepa-wm/baseline.yaml RUN_ROOT=$STORAGE_ROOT/runs/jepa-baseline   sbatch scripts/slurm/jepa_eval.sbatch
+CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth   sbatch scripts/slurm/jepa_eval.sbatch
+
+# Aggregate across seeds and models (mean ± std, Mann-Whitney U + Holm).
+uv run quadwm report $STORAGE_ROOT/runs/*/*/eval/last-*.json --output report.md
+```
+
+`quadwm report` flags runs whose eval config, horizons, windows, or mission
+splits differ; protocol §11 needs at least 3 seeds per model
+before any comparison is called a result.
 
 ## GrandTour Track 1 data path
 
