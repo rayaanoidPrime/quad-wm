@@ -19,7 +19,9 @@ def _expand_environment(text: str) -> str:
         if value is not None:
             return value
         if fallback is not None:
-            return fallback
+            # Python never expands "~" in paths the way a shell does, so a
+            # "${VAR:-~/x}" default would otherwise create a literal ./~ dir.
+            return os.path.expanduser(fallback)
         raise RuntimeError(f"environment variable {name!r} is required by the config")
 
     return _ENV_PATTERN.sub(replace, text)

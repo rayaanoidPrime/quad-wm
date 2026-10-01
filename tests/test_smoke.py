@@ -50,3 +50,13 @@ def test_wandb_init_uses_config_without_network(monkeypatch, tmp_path):
     assert calls["dir"] == str(tmp_path)
     assert calls["settings"]["settings"]["start_method"] == "thread"
     assert calls["config"]["runtime"]["slurm_job_id"] == "123"
+
+def test_config_expands_home_in_environment_defaults(monkeypatch, tmp_path):
+    monkeypatch.delenv("QUADWM_TEST_ROOT", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("run_root: ${QUADWM_TEST_ROOT:-~/quad-wm-storage/runs}\n", encoding="utf-8")
+
+    run_root = load_config(config_path)["run_root"]
+
+    assert not run_root.startswith("~")
+    assert Path(run_root) == Path.home() / "quad-wm-storage" / "runs"

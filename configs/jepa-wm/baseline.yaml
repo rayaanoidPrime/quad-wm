@@ -9,7 +9,7 @@ data_config: configs/data/baseline.yaml
 
 cache:
   mode: auto
-  root: ${QUADWM_CACHE_ROOT:-~quad-wm/cache/vjepa21}
+  root: ${QUADWM_CACHE_ROOT:-~/quad-wm-storage/cache/vjepa21}
   batch_size: 16
 
 model:
