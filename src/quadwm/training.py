@@ -158,6 +158,14 @@ def _build_token_cache(
         shape = (len(image_ids), *first_tokens.shape[1:])
         if _cache_valid(cache_root, mission, image_ids, shape):
             continue
+        metadata_path = cache_root / f"{mission}.json"
+        if metadata_path.is_file():
+            # Rebuild as the union with what is cached, so a dataset with other
+            # windows (protocol eval vs training) never drops the other's ids.
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if tuple(existing["shape"][1:]) == shape[1:]:
+                image_ids = sorted(set(image_ids) | set(existing["image_ids"]))
+                shape = (len(image_ids), *shape[1:])
         print(
             f"stage=feature_cache mission={mission} images={len(image_ids)} "
             f"shape={tuple(shape)}",
@@ -185,6 +193,7 @@ def _build_token_cache(
                 )[:, 0]
                 tokens[start : start + len(ids)] = encoder(images).float().cpu().numpy().astype(np.float16)
             tokens.flush()
+            del tokens  # close the mapping; Windows cannot rename an open file
             metadata_temporary.write_text(
                 json.dumps({"image_ids": image_ids, "shape": list(shape)}) + "\n",
                 encoding="utf-8",

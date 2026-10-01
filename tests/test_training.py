@@ -76,3 +76,16 @@ def test_token_cache_removes_partial_files_on_failure(tmp_path):
         )
 
     assert list(tmp_path.glob("*.part")) == []
+
+def test_token_cache_rebuild_keeps_previously_cached_ids(tmp_path):
+    """The protocol eval caches other windows than training; neither may drop the other's ids."""
+    _build_token_cache(_Dataset(), _RecordingEncoder(), tmp_path, torch.device("cpu"), batch_size=2, image_size=64)
+
+    other_windows = _Dataset()
+    other_windows.index = [(0, (3, 4))]
+    _build_token_cache(other_windows, _RecordingEncoder(), tmp_path, torch.device("cpu"), batch_size=2,
+                       image_size=64)
+
+    metadata = json.loads((tmp_path / "mission-a.json").read_text(encoding="utf-8"))
+    assert metadata["image_ids"] == [0, 1, 2, 3, 4]
+    assert metadata["shape"] == [5, 4, 8]
