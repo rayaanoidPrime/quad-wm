@@ -87,6 +87,11 @@ class LatentPredictor(nn.Module):
 
 
 class LeWorldModel(nn.Module):
+    """End-to-end depth + proprio JEPA; same Track 1 model interface as JEPAWorldModel."""
+
+    frozen_visual_encoder = False  # takes raw depth; no V-JEPA, no token cache
+    image_channels = 2  # pooled depth (m) + valid fraction
+
     def __init__(
         self,
         *,
@@ -110,6 +115,8 @@ class LeWorldModel(nn.Module):
     ):
         super().__init__()
         self.context_steps, self.rollout_steps = context_steps, rollout_steps
+        self.image_size, self.latent_dim = image_size, latent_dim
+        self.action_dim, self.proprio_dim = action_dim, proprio_dim
         self.weights = {"pred": 1.0, "rollout": 1.0, "sigreg": 0.1, "state": 0.0, "transition": 0.0}
         self.weights |= loss_weights or {}
         self.sigreg_slices, self.transition_horizons = sigreg_slices, tuple(transition_horizons)
@@ -134,6 +141,21 @@ class LeWorldModel(nn.Module):
         batch, frames = proprio.shape[:2]
         latents = self.encoder(depth.flatten(0, 1), proprio.flatten(0, 1))
         return latents.view(batch, frames, -1)
+
+    @property
+    def frame_shape(self) -> tuple[int, ...]:
+        return (self.latent_dim,)
+
+    def encode_frames(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> Tensor:
+        """Latents [B, T, D]; ``visual_tokens`` is ignored (no frozen encoder)."""
+        return self.encode(batch["images"], batch["proprio"])
+
+    def probe_latent(self, frames: Tensor) -> Tensor:
+        return frames
+
+    def training_only_modules(self) -> list[nn.Module]:
+        """PSG grounding heads: they exist only for training losses (EV7 reports them separately)."""
+        return [head for head in (self.state_head, self.transition_head) if head is not None]
 
     def rollout(self, context: Tensor, actions: Tensor, steps: int) -> Tensor:
         """Open-loop: [B, W, D] context + actions aligned to frames (actions[:, i] moves

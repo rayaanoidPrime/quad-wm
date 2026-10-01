@@ -23,14 +23,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..data import build_sequence_dataset
-from ..models import LeWorldModel, VJEPA21Encoder, build_model
-from ..training import (
-    _batch_visual_tokens,
-    _build_token_cache,
-    _cache_fits,
-    _from_scratch,
-    _load_token_caches,
-)
+from ..models import VJEPA21Encoder, build_model
+from ..tokens import build_token_cache, cache_fits, load_token_caches, model_inputs
 from ..utils import run_metadata
 from .metrics import (
     evaluation_sigma,
@@ -40,7 +34,7 @@ from .metrics import (
     select_anchor_windows,
 )
 from .probes import StateProbe, fit_probe
-from .rollout import protocol_latents, training_only_modules
+from .rollout import protocol_latents
 
 NOT_RUN = {
     "EV1_sim_EV2_EV3_EV4_EV6": "simulated evals run separately: `quadwm sim-eval` (docs/adr/0006); "
@@ -136,19 +130,15 @@ def protocol_windows(data_cfg: dict, missions: list[str], eval_config: dict, *, 
 
 
 @torch.no_grad()
-def _collect(model, dataset, caches, *, use_cache: bool, eval_config: dict, image_size: int,
+def _collect(model, dataset, caches, *, use_cache: bool, eval_config: dict,
              device: torch.device, precision: torch.dtype, rollout: bool) -> dict[str, torch.Tensor]:
     loader = DataLoader(dataset, batch_size=int(eval_config["batch_size"]), shuffle=False,
                         num_workers=int(eval_config.get("num_workers", 0)), pin_memory=True, drop_last=False)
     context_frames = int(eval_config["context_frames"])
     steps = max(int(k) for k in eval_config["horizons"]) if rollout else 0
     parts: dict[str, list[torch.Tensor]] = {"encoded": [], "predicted": [], "states": [], "mission_idx": []}
-    lewm = _is_lewm(model)
-    keys = ("proprio", "actions", "images") if lewm else ("proprio", "actions")
     for batch in loader:
-        # The baseline's images go through its frozen encoder (or the token cache) instead.
-        tokens = None if lewm else _batch_visual_tokens(model, batch, caches, device, image_size, use_cache)
-        moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+        moved, tokens = model_inputs(model, batch, device, caches if use_cache else None)
         with torch.autocast(device_type=device.type, dtype=precision, enabled=device.type == "cuda"):
             outputs = protocol_latents(model, moved, context_frames=context_frames, steps=steps,
                                        visual_tokens=tokens)
@@ -158,10 +148,6 @@ def _collect(model, dataset, caches, *, use_cache: bool, eval_config: dict, imag
         parts["states"].append(batch["state"].float())
         parts["mission_idx"].append(torch.as_tensor(batch["mission_idx"]))
     return {key: torch.cat(values) for key, values in parts.items() if values}
-
-
-def _is_lewm(model) -> bool:
-    return isinstance(model, LeWorldModel)
 
 
 def _summary(errors: dict[str, torch.Tensor]) -> tuple[dict[str, float], dict[str, float]]:
@@ -241,57 +227,37 @@ def _timed(function, device: torch.device, warmup: int, repeats: int) -> float:
 
 
 @torch.no_grad()
-def _compute_parity(model, encoder, model_cfg: dict, data_cfg: dict, eval_config: dict, run_root: Path,
-                    device: torch.device, precision: torch.dtype) -> dict:
-    """EV7 on random inputs of the true shapes (timing does not depend on values)."""
+def _compute_parity(model, eval_config: dict, run_root: Path, device: torch.device, precision: torch.dtype) -> dict:
+    """EV7 on random inputs of the true shapes (timing does not depend on values).
+
+    Times the same ``model.rollout`` the eval scores, from a full ``context_steps`` context.
+    """
     cfg = eval_config["compute"]
-    batch, steps = int(cfg.get("batch_size", 8)), max(int(k) for k in eval_config["horizons"])
-    warmup, repeats = int(cfg.get("warmup", 5)), int(cfg.get("repeats", 20))
-    training_only = sum(p.numel() for head in training_only_modules(model) for p in head.parameters())
+    batch, steps = int(cfg["batch_size"]), max(int(k) for k in eval_config["horizons"])
+    warmup, repeats = int(cfg["warmup"]), int(cfg["repeats"])
+    encoder = model.visual_encoder if model.frozen_visual_encoder else None
+    training_only = sum(p.numel() for head in model.training_only_modules() for p in head.parameters())
     encoder_params = sum(p.numel() for p in encoder.parameters()) if encoder is not None else 0
     own = sum(p.numel() for name, p in model.named_parameters() if not name.startswith("visual_encoder."))
-    action_dim, proprio_dim = int(model_cfg.get("action_dim", 120)), int(model_cfg.get("proprio_dim", 33))
     autocast = torch.autocast(device_type=device.type, dtype=precision, enabled=device.type == "cuda")
-    if _is_lewm(model):
-        size = int(model_cfg.get("image_size", 64))
-        context = model.context_steps
-        latent = torch.randn(batch, context, model.predictor.lift.in_features, device=device)
-        actions = torch.randn(batch, context + steps - 1, action_dim, device=device)
-        depth = torch.rand(1, 1, 2, size, size, device=device)
-        proprio = torch.randn(1, 1, proprio_dim, device=device)
+    context = model.context_steps
+    frames = torch.randn(batch, context, *model.frame_shape, device=device)
+    actions = torch.randn(batch, context + steps - 1, model.action_dim, device=device)
+    size = model.image_size
+    observation = {"images": torch.rand(1, 1, model.image_channels, size, size, device=device),
+                   "proprio": torch.randn(1, 1, model.proprio_dim, device=device)}
 
-        def rollout():
-            with autocast:
-                model.rollout(latent, actions, steps)
+    def rollout():
+        with autocast:
+            model.rollout(frames, actions, steps)
 
-        def single():
-            with autocast:
-                z = model.encode(depth, proprio)
-                model.rollout(torch.cat((latent[:1, 1:], z), 1), actions[:1], 1)
-    else:
-        size = int(model_cfg.get("image_size", 384))
-        tokens, dim = model.tokens_per_frame, model.model_dim
-        window = model.rollout_context
-        context = torch.randn(batch, window, tokens, dim, device=device)
-        actions = torch.randn(batch, action_dim, device=device)
-        image = torch.randn(1, 3, size, size, device=device)
-        proprio = torch.randn(1, 1, proprio_dim, device=device)
+    def single():  # one new camera frame (through the frozen encoder, if any) -> one predicted frame
+        with autocast:
+            latest = model.encode_frames(*model_inputs(model, observation, device))
+            model.rollout(torch.cat((frames[:1, 1:], latest), 1), actions[:1], 1)
 
-        def rollout():
-            with autocast:
-                frames = context
-                for _ in range(steps):
-                    prediction = model.predict_next(frames[:, -window:], actions)
-                    frames = torch.cat((frames[:, 1:], prediction.unsqueeze(1)), 1)
-
-        def single():
-            with autocast:
-                observation = model.encode_observation(encoder(image).unsqueeze(1), proprio)
-                model.predict_next(torch.cat((context[:1, 1:], observation), 1), actions[:1])
-
-    model.eval()
     rollout_s = _timed(rollout, device, warmup, repeats)
-    single_s = _timed(single, device, warmup, repeats) if encoder is not None or _is_lewm(model) else None
+    single_s = _timed(single, device, warmup, repeats)
     return {
         "parameters_M": {
             "world_model_trainable": own / 1e6,
@@ -301,7 +267,7 @@ def _compute_parity(model, encoder, model_cfg: dict, data_cfg: dict, eval_config
         },
         "rollout_throughput_fps": batch * steps / rollout_s,
         "rollout_batch_size": batch,
-        "single_step_latency_ms": single_s * 1000 if single_s is not None else None,
+        "single_step_latency_ms": single_s * 1000,
         "deployment_latency_ms": None,  # observation -> action needs a policy (EV3)
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "precision": str(precision).removeprefix("torch."),
@@ -351,9 +317,11 @@ def open_checkpoint(config: dict, checkpoint: Path | None, seed: int) -> tuple[P
 
 
 def load_model(saved: dict, checkpoint_root: Path):
-    """The checkpoint's world model on CPU, without the frozen encoder (reloaded separately)."""
+    """The checkpoint's world model on CPU, with its frozen encoder (never trained, so reloaded) attached."""
     model = build_model(saved["config"]["model"], checkpoint_root)
     model.load_state_dict(_strip_encoder(saved["model"]))
+    if model.frozen_visual_encoder:
+        model.visual_encoder = VJEPA21Encoder(checkpoint_root)
     return model
 
 
@@ -372,7 +340,6 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
     seed = int(eval_config.get("seed", 4551))
     run_root, checkpoint, saved, device = open_checkpoint(config, checkpoint, seed)
     trained = saved["config"]
-    model_cfg = trained["model"]
     data_cfg = dict(config["data"])  # paths from this machine; transforms from the checkpoint
     data_cfg["observation"] = trained["data"]["observation"]
     normalization = trained["data"].get("normalization")
@@ -382,11 +349,9 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
     print(f"stage=eval status=starting checkpoint={checkpoint} epoch={saved.get('epoch')} "
           f"device={device} horizons={horizons}", flush=True)
 
-    lewm = _from_scratch(trained)
-    checkpoint_root = Path(config.get("checkpoint_root", "checkpoints"))
+    model = load_model(saved, Path(config.get("checkpoint_root", "checkpoints"))).to(device).eval()
     cache_cfg = config.get("cache", {})
-    use_cache = cache_cfg.get("mode", "auto") != "off" and not lewm
-    image_size = int(model_cfg.get("image_size", 384))
+    use_cache = cache_cfg.get("mode", "auto") != "off" and model.frozen_visual_encoder
     datasets = {}
     for split in ("probe", "eval"):
         datasets[split] = protocol_windows(data_cfg, splits[split], eval_config, load_images=True)
@@ -394,30 +359,21 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
         print(f"stage=eval_windows split={split} missions={len(datasets[split].readers)} "
               f"windows={len(datasets[split])}", flush=True)
 
-    encoder = None if lewm else VJEPA21Encoder(checkpoint_root)
     caches = {"probe": [], "eval": []}
     if use_cache:
         cache_root = Path(cache_cfg.get("root", Path(data_cfg["data_root"]) / "quadwm-token-cache"))
         cache_root.mkdir(parents=True, exist_ok=True)
-        use_cache = _cache_fits(list(datasets.values()), cache_root, int(model_cfg["tokens_per_frame"]),
-                                int(model_cfg["visual_dim"]))
+        use_cache = cache_fits(list(datasets.values()), cache_root, model.tokens_per_frame, model.visual_dim)
     if use_cache:
         for split, dataset in datasets.items():
-            _build_token_cache(dataset, encoder, cache_root, device, int(cache_cfg.get("batch_size", 16)),
-                               image_size)
+            build_token_cache(dataset, model.visual_encoder, cache_root, device,
+                              int(cache_cfg.get("batch_size", 16)), model.image_size)
             dataset.load_images = False
-            caches[split] = _load_token_caches(cache_root, dataset.readers, True)
-
-    model = load_model(saved, checkpoint_root)
-    if encoder is not None and not use_cache:
-        model.visual_encoder = encoder
-    model.to(device).eval()
-    if encoder is not None:
-        encoder.to(device).eval()
+            caches[split] = load_token_caches(cache_root, dataset.readers, True)
 
     collected = {
         split: _collect(model, dataset, caches[split], use_cache=use_cache, eval_config=eval_config,
-                        image_size=image_size, device=device, precision=precision, rollout=split == "eval")
+                        device=device, precision=precision, rollout=split == "eval")
         for split, dataset in datasets.items()
     }
     mission_names = [reader.mission_dir.name for reader in datasets["eval"].readers]
@@ -448,8 +404,7 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
         "metadata": run_metadata(config) | {"eval_seed": seed, "device": str(device)},
     }
     if eval_config.get("compute", {}).get("enabled", True):
-        result["compute"] = _compute_parity(model, encoder, model_cfg, data_cfg, eval_config, run_root,
-                                            device, precision)
+        result["compute"] = _compute_parity(model, eval_config, run_root, device, precision)
     output = Path(output) if output else run_root / "eval" / f"{checkpoint.stem}-{eval_config.get('name', 'protocol')}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(_finite(result), indent=2) + "\n", encoding="utf-8")

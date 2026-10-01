@@ -25,9 +25,9 @@ from torch import Tensor
 from ..data.grandtour import STATE_LAYOUT
 from ..sim.base import DynamicsSpec, TerrainSpec
 from ..sim.episodes import fallen, frame_images
-from ..training import _prepare_images
+from ..tokens import model_inputs
 from .probes import StateProbe
-from .rollout import encode_frames, rollout_latents
+from .rollout import rollout_latents
 
 
 def cem(cost, shape: tuple[int, ...], *, population: int, elites: int, iterations: int, init_std: float,
@@ -60,16 +60,15 @@ def locomotion_cost(states: Tensor, command_mps: float, weights: dict) -> Tensor
 
 @dataclass
 class Planner:
-    """A frozen world model + frozen probe, planning controller residuals by CEM."""
+    """A frozen world model (with its frozen encoder, if any) + frozen probe, planning controller
+    residuals by CEM."""
 
     model: torch.nn.Module
     probe: StateProbe
-    encoder: torch.nn.Module | None  # V-JEPA for the baseline; None for LeWM
     normalization: dict
     modality: str
     depth_size: int
     depth_range: tuple
-    image_size: int
     config: dict
     device: torch.device
     precision: torch.dtype
@@ -87,17 +86,14 @@ class Planner:
 
     @torch.no_grad()
     def encode(self, observations: list[dict]) -> Tensor:
-        """The last ``context_steps`` observations -> encode_frames output with batch 1."""
+        """The last ``context_steps`` observations -> ``model.encode_frames`` output with batch 1."""
         frames = [observation[self.modality] for observation in observations]
-        images = frame_images(frames, self.modality, self.depth_size, self.depth_range)[None].to(self.device)
+        images = frame_images(frames, self.modality, self.depth_size, self.depth_range)[None]
         proprio = torch.as_tensor(np.stack([o["proprio"] for o in observations]), device=self.device)[None]
         proprio = (proprio - self.stats["proprio_mean"]) / self.stats["proprio_std"]
         with self._autocast():
-            tokens = None
-            if self.encoder is not None:
-                prepared = _prepare_images(images, self.device, self.image_size)
-                tokens = self.encoder(prepared.flatten(0, 1)).unflatten(0, prepared.shape[:2])
-            return encode_frames(self.model, {"images": images, "proprio": proprio}, tokens)
+            return self.model.encode_frames(*model_inputs(self.model, {"images": images, "proprio": proprio},
+                                                          self.device))
 
     @torch.no_grad()
     def predict_states(self, frames: Tensor, past_actions: np.ndarray, future_actions: Tensor) -> Tensor:

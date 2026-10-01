@@ -203,9 +203,22 @@ class Predictor(nn.Module):
 
 
 class JEPAWorldModel(nn.Module):
+    """Frozen V-JEPA 2.1 tokens + proprio -> next-frame tokens.
+
+    Track 1 model interface (shared with LeWorldModel, used by every eval):
+    ``encode_frames``, ``rollout``, ``probe_latent``, ``training_only_modules``,
+    ``frame_shape``, and the attributes ``frozen_visual_encoder``,
+    ``image_channels``, ``image_size``, ``context_steps``, ``action_dim``,
+    ``proprio_dim``.
+    """
+
+    frozen_visual_encoder = True  # images go through V-JEPA (or the token cache) first
+    image_channels = 3
+
     def __init__(
         self,
         *,
+        image_size: int = 384,
         visual_dim: int = 768,
         proprio_dim: int = 33,
         proprio_embed_dim: int = 16,
@@ -218,6 +231,8 @@ class JEPAWorldModel(nn.Module):
         encoder: nn.Module | None = None,
     ):
         super().__init__()
+        self.image_size = image_size
+        self.action_dim, self.proprio_dim = action_dim, proprio_dim
         self.visual_dim = visual_dim
         self.proprio_embed_dim = proprio_embed_dim
         self.model_dim = visual_dim + proprio_embed_dim
@@ -251,16 +266,56 @@ class JEPAWorldModel(nn.Module):
         prop = prop.expand(*prop.shape[:-2], visual.shape[-2], prop.shape[-1]) # [B,T,576,16]
         return torch.cat((visual, prop), dim=-1) # [B, T, 576, 784]
 
-    def _normalized_slices(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
+    def normalized_slices(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
         """Per-slice LayerNorm (no affine): the space every loss and metric uses."""
         visual, prop = tokens[..., : self.visual_dim], tokens[..., self.visual_dim :]
         return F.layer_norm(visual, (self.visual_dim,)), F.layer_norm(prop, (self.proprio_embed_dim,))
+
+    @property
+    def frame_shape(self) -> tuple[int, ...]:
+        return (self.tokens_per_frame, self.model_dim)
+
+    def encode_frames(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> Tensor:
+        """Observation tokens [B, T, N, D] from frozen ``visual_tokens`` (or prepared ``batch["images"]``)."""
+        if visual_tokens is None:
+            images = batch["images"]  # [B, T, C, H, W], already prepared for V-JEPA
+            visual_tokens = self.encode_visual(images.flatten(0, 1)).unflatten(0, images.shape[:2])
+        return self.encode_observation(visual_tokens, batch["proprio"])
 
     def predict_next(self, context: Tensor, actions: Tensor) -> Tensor:
         action = self.action_encoder(actions) # [B, T , 784]
         if action.ndim == 2:
             action = action.unsqueeze(1).expand(-1, context.shape[1], -1)
         return self.predictor(context, action)
+
+    def rollout(self, context: Tensor, actions: Tensor, steps: int, *, detach_feedback: bool = False) -> Tensor:
+        """Open-loop: [B, W, N, D] context + frame-aligned actions (``actions[:, i]`` moves frame i to
+        i + 1, so W + steps - 1 are needed) -> [B, steps, N, D] predicted frames.
+
+        The first step sees the whole context; later steps see the last
+        ``rollout_context`` frames, predictions included. Training detaches
+        the fed-back predictions so each step's gradient stays local.
+        """
+        start = context.shape[1] - 1
+        if actions.shape[1] < start + steps:
+            raise ValueError(f"need {start + steps} frame-aligned actions, got {actions.shape[1]}")
+        keep = self.rollout_context - 1
+        window, predictions = context, []
+        for step in range(steps):
+            prediction = self.predict_next(window, actions[:, start + step])
+            predictions.append(prediction)
+            fed = prediction.detach() if detach_feedback else prediction
+            history = window[:, window.shape[1] - keep :] if keep else window[:, :0]
+            window = torch.cat((history, fed.unsqueeze(1)), dim=1)
+        return torch.stack(predictions, dim=1)
+
+    def probe_latent(self, frames: Tensor) -> Tensor:
+        """[..., N, D] frames -> [..., visual + proprio] token mean in the normalized space (docs/adr/0005)."""
+        visual, prop = self.normalized_slices(frames)
+        return torch.cat((visual.mean(-2), prop.mean(-2)), dim=-1)
+
+    def training_only_modules(self) -> list[nn.Module]:
+        return []
 
     def loss(self, visual_tokens: Tensor, proprio: Tensor, actions: Tensor) -> dict[str, Tensor]:
         observations = self.encode_observation(visual_tokens, proprio) # [B,T,576, 784]
@@ -270,16 +325,16 @@ class JEPAWorldModel(nn.Module):
                 f"expected observations={context_steps + 1}+ and actions={context_steps}+, "
                 f"got {observations.shape[1]} and {actions.shape[1]}"
             )
-        context = observations[:, :context_steps] # [B, 7, 576, 784] first 7 frames as context
-        rollout_actions = actions[:, context_steps - 1 :] # [B, future actions, 120]
+        steps = actions.shape[1] - (context_steps - 1)  # one prediction per action after the context
+        # [B, steps, 576, 784] from the first 7 frames as context
+        predictions = self.rollout(observations[:, :context_steps], actions, steps, detach_feedback=True)
         losses: dict[str, Tensor] = {}
         rollout_losses = []
         visual_losses = []
         proprio_losses = []
-        for step, action in enumerate(rollout_actions.unbind(dim=1)):
-            predictor_context = context if step == 0 else context[:, -self.rollout_context :] # take all frames for step 0 then last rollout window from next steps
-            prediction = self.predict_next(predictor_context, action) # [B, 576, 784]
-            target_visual, target_prop = self._normalized_slices(
+        for step in range(steps):
+            prediction = predictions[:, step]
+            target_visual, target_prop = self.normalized_slices(
                 observations[:, context_steps + step].detach()
             )
             visual_loss = F.mse_loss(prediction[..., : self.visual_dim], target_visual)
@@ -289,7 +344,6 @@ class JEPAWorldModel(nn.Module):
             rollout_losses.append(step_loss)
             visual_losses.append(visual_loss)
             proprio_losses.append(proprio_loss)
-            context = torch.cat((context[:, -self.rollout_context + 1 :], prediction.detach().unsqueeze(1)), dim=1)
         if not rollout_losses:
             raise ValueError("batch contains no rollout actions")
         first = rollout_losses[0]
@@ -313,21 +367,20 @@ class JEPAWorldModel(nn.Module):
         """
         observations = self.encode_observation(visual_tokens, proprio)
         context_steps = self.context_steps
-        context = observations[:, :context_steps]
-        rollout_actions = actions[:, context_steps - 1 :]
+        steps = actions.shape[1] - (context_steps - 1)
+        predictions = self.rollout(observations[:, :context_steps], actions, steps)
         persistence = observations[:, context_steps - 1]
         metrics: dict[str, float] = {}
         visual_errors = []
         proprio_errors = []
-        for step, action in enumerate(rollout_actions.unbind(dim=1)):
-            predictor_context = context if step == 0 else context[:, -self.rollout_context :]
-            prediction = self.predict_next(predictor_context, action)
+        for step in range(steps):
+            prediction = predictions[:, step]
             prefix = f"step_{step + 1}"
             # Model, target and persistence all go through the same per-slice
             # LayerNorm, so the persistence gate compares like with like.
-            pred_visual, pred_prop = self._normalized_slices(prediction)
-            target_visual, target_prop = self._normalized_slices(observations[:, context_steps + step])
-            persist_visual, persist_prop = self._normalized_slices(persistence)
+            pred_visual, pred_prop = self.normalized_slices(prediction)
+            target_visual, target_prop = self.normalized_slices(observations[:, context_steps + step])
+            persist_visual, persist_prop = self.normalized_slices(persistence)
             visual = F.mse_loss(pred_visual, target_visual)
             prop = F.mse_loss(pred_prop, target_prop)
             metrics[f"{prefix}/visual_mse"] = float(visual)
@@ -336,9 +389,6 @@ class JEPAWorldModel(nn.Module):
             metrics[f"{prefix}/persistence_proprio_mse"] = float(F.mse_loss(persist_prop, target_prop))
             visual_errors.append(visual)
             proprio_errors.append(prop)
-            context = torch.cat(
-                (context[:, -self.rollout_context + 1 :], prediction.unsqueeze(1)), dim=1
-            )
         metrics["visual_mse"] = float(torch.stack(visual_errors).mean())
         metrics["proprio_mse"] = float(torch.stack(proprio_errors).mean())
         # Collapse signature from recipe §7: the proprio slice's variance should stay > 0.

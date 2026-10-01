@@ -24,11 +24,9 @@ import torch
 
 from ..config import load_config
 from ..data.grandtour import state_vectors
-from ..models import VJEPA21Encoder
 from ..sim import DynamicsSpec, TerrainSpec, build_simulator
 from ..sim.controller import build_controller
 from ..sim.episodes import SimWindowDataset, camera_modality, episode_set, fallen, load_episode
-from ..training import _from_scratch
 from ..utils import run_metadata
 from .metrics import evaluation_sigma
 from .planning import Planner, run_episode
@@ -228,7 +226,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
     seed = int(sim_eval_config.get("seed", 4551))
     run_root, checkpoint, saved, device = open_checkpoint(config, checkpoint, seed)
     trained = saved["config"]
-    model_cfg, data_cfg = trained["model"], trained["data"]
+    data_cfg = trained["data"]
     normalization = data_cfg.get("normalization")
     modality = camera_modality(data_cfg["observation"])
     precision = torch.bfloat16 if protocol_cfg.get("precision", "bf16") == "bf16" else torch.float16
@@ -243,12 +241,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
         return build_controller(sim_cfg, controller_cfg)
 
     checkpoint_root = Path(config.get("checkpoint_root", "checkpoints"))
-    model = load_model(saved, checkpoint_root)
-    encoder = None if _from_scratch(trained) else VJEPA21Encoder(checkpoint_root)
-    if encoder is not None:
-        model.visual_encoder = encoder
-    model.to(device).eval()
-    image_size = int(model_cfg.get("image_size", 384))
+    model = load_model(saved, checkpoint_root).to(device).eval()
     depth_size, depth_range = int(data_cfg.get("depth_size", 64)), tuple(data_cfg.get("depth_range", (0.2, 10.0)))
     print(f"stage=sim_eval status=starting checkpoint={checkpoint} modality={modality} evals={sorted(only)}",
           flush=True)
@@ -269,7 +262,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
             raise ValueError(f"no fall-free sim windows in the {split} episodes")
         print(f"stage=sim_eval split={split} episodes={len(paths[split])} windows={len(dataset)}", flush=True)
     collected = {
-        split: _collect(model, dataset, [], use_cache=False, eval_config=protocol_cfg, image_size=image_size,
+        split: _collect(model, dataset, [], use_cache=False, eval_config=protocol_cfg,
                         device=device, precision=precision, rollout=split == "eval")
         for split, dataset in datasets.items()
     }
@@ -281,9 +274,9 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
     sigma = evaluation_sigma(collected["eval"]["states"], float(protocol_cfg.get("sigma_floor", 1e-3)))
 
     planning_cfg = sim_eval_config["planning"]
-    planner = Planner(model=model, probe=fitted[planning_cfg.get("probe", "mlp")], encoder=encoder,
+    planner = Planner(model=model, probe=fitted[planning_cfg.get("probe", "mlp")],
                       normalization=normalization, modality=modality, depth_size=depth_size,
-                      depth_range=depth_range, image_size=image_size, config=planning_cfg, device=device,
+                      depth_range=depth_range, config=planning_cfg, device=device,
                       precision=precision)
     result = {
         "protocol": "recipes/shared_evaluation_protocol.md",
