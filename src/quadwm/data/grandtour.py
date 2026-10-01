@@ -161,7 +161,10 @@ def normalization_stats(readers: list[MissionReader], action_frames: int) -> dic
 
 def _extract_tars(cache_dir: Path, dest_dir: Path, allow_patterns: list[str] | None) -> None:
     def to_regex(patterns: list[str]) -> re.Pattern:
-        parts = [f".*{re.escape(p).replace(r'\*', '.*').replace(r'\?', '.')}$" for p in patterns]
+        # Glob -> regex. Built outside the f-string: backslashes inside f-string
+        # expressions are a syntax error before Python 3.12.
+        globs = [re.escape(p).replace(r"\*", ".*").replace(r"\?", ".") for p in patterns]
+        parts = [f".*{glob}$" for glob in globs]
         return re.compile("|".join(parts))
 
     pattern = to_regex(allow_patterns) if allow_patterns else None
