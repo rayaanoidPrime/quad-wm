@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from quadwm.training import _build_token_cache
+from quadwm.tokens import build_token_cache
 
 
 class _RecordingEncoder(torch.nn.Module):
@@ -37,7 +37,7 @@ class _Dataset:
 def test_token_cache_feeds_chw_images_to_encoder(tmp_path):
     encoder = _RecordingEncoder()
 
-    _build_token_cache(_Dataset(), encoder, tmp_path, torch.device("cpu"), batch_size=2, image_size=64)
+    build_token_cache(_Dataset(), encoder, tmp_path, torch.device("cpu"), batch_size=2, image_size=64)
 
     # Regression: the cache path previously passed HWC tensors straight to
     # _prepare_images, which expects NCHW and would interpolate across the
@@ -51,7 +51,7 @@ def test_token_cache_feeds_chw_images_to_encoder(tmp_path):
 
 
 def test_cache_valid_accepts_superset_of_ids(tmp_path):
-    from quadwm.training import _cache_valid
+    from quadwm.tokens import _cache_valid
 
     (tmp_path / "mission-a.mmap").write_bytes(b"")
     (tmp_path / "mission-a.json").write_text(
@@ -71,7 +71,7 @@ def test_token_cache_removes_partial_files_on_failure(tmp_path):
             raise RuntimeError("encoder blew up")
 
     with pytest.raises(RuntimeError, match="encoder blew up"):
-        _build_token_cache(
+        build_token_cache(
             _Dataset(), _FailingEncoder(), tmp_path, torch.device("cpu"), batch_size=2, image_size=64
         )
 
@@ -79,11 +79,11 @@ def test_token_cache_removes_partial_files_on_failure(tmp_path):
 
 def test_token_cache_rebuild_keeps_previously_cached_ids(tmp_path):
     """The protocol eval caches other windows than training; neither may drop the other's ids."""
-    _build_token_cache(_Dataset(), _RecordingEncoder(), tmp_path, torch.device("cpu"), batch_size=2, image_size=64)
+    build_token_cache(_Dataset(), _RecordingEncoder(), tmp_path, torch.device("cpu"), batch_size=2, image_size=64)
 
     other_windows = _Dataset()
     other_windows.index = [(0, (3, 4))]
-    _build_token_cache(other_windows, _RecordingEncoder(), tmp_path, torch.device("cpu"), batch_size=2,
+    build_token_cache(other_windows, _RecordingEncoder(), tmp_path, torch.device("cpu"), batch_size=2,
                        image_size=64)
 
     metadata = json.loads((tmp_path / "mission-a.json").read_text(encoding="utf-8"))

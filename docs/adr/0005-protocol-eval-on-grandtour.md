@@ -27,7 +27,7 @@ What runs:
 | §1.3 rule 4 | Probes are fit on the run's `splits.json` probe missions (ADR 0001) and scored on its eval missions. A run whose splits predate ADR 0001 is refused. |
 | E1.2 | R² and Pearson r per state component, on encoded latents of the eval missions. |
 | EV5 (EV1 metric, real data) | ε_k at k ∈ {1, 5, 12, 25, 50}: mean σ-normalized L2 between the probe applied to the open-loop rollout and the logged state. σ is the per-component std over the eval set. Reported for all 40 dims and per component. |
-| EV7 | Parameters (inference, training-only heads, frozen encoder), open-loop rollout FPS, batch-1 single-step latency (encode the new frame + one predictor step), and approximate training GPU-hours from `metrics.jsonl`. |
+| EV7 | Parameters (inference, training-only heads, frozen encoder), open-loop rollout FPS, batch-1 single-step latency (encode the new frame + one predictor step), and approximate training GPU-hours from `metrics.jsonl`. Rollout FPS times `model.rollout` from a full `context_steps` context, the same recurrence the eval scores. Eval JSONs written before this was fixed timed the baseline from a shorter `rollout_context` window, so their baseline FPS is not comparable. |
 | §11 | Mean ± std with n, Mann-Whitney U per horizon, Holm correction across the comparison table. Only reported for n ≥ 3. |
 
 Choices the protocol does not settle:

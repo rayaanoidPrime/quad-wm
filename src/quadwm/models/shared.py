@@ -80,6 +80,11 @@ def load_checkpoint(
     return int(checkpoint.get("epoch", 0))
 
 
+def model_class(wm_config: dict) -> type[JEPAWorldModel] | type[LeWorldModel]:
+    """The class ``build_model`` builds, for decisions made before the model exists (token cache, encoder)."""
+    return LeWorldModel if wm_config.get("type") == "lewm" else JEPAWorldModel
+
+
 def build_model(
     wm_config: dict,
     checkpoint_root: str | Path,
@@ -87,10 +92,11 @@ def build_model(
     visual_encoder: torch.nn.Module | None = None,
 ) -> JEPAWorldModel | LeWorldModel:
     """Build the configured Track 1 model: ``type: lewm`` or the frozen-encoder baseline."""
-    if wm_config.get("type") == "lewm":
+    if model_class(wm_config) is LeWorldModel:
         # Every other model key is a constructor argument, so a typo fails loudly.
         return LeWorldModel(**{key: value for key, value in wm_config.items() if key != "type"})
     return JEPAWorldModel(
+        image_size=int(wm_config.get("image_size", 384)),
         visual_dim=int(wm_config.get("visual_dim", 768)),
         proprio_dim=int(wm_config.get("proprio_dim", 33)),
         proprio_embed_dim=int(wm_config.get("proprio_embed_dim", 16)),

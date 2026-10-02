@@ -150,7 +150,7 @@ def test_baseline_protocol_rollout_matches_training_recurrence():
     observations = model.encode_observation(tokens, proprio)
     first = model.predict_next(observations[:, :2], actions[:, 1])
     second = model.predict_next(torch.cat((observations[:, 1:2], first[:, None]), 1), actions[:, 2])
-    pooled = lambda tokens: torch.cat([part.mean(-2) for part in model._normalized_slices(tokens)], -1)
+    pooled = lambda tokens: torch.cat([part.mean(-2) for part in model.normalized_slices(tokens)], -1)
     assert torch.allclose(out["predicted"][:, 0], pooled(first), atol=1e-5)
     assert torch.allclose(out["predicted"][:, 1], pooled(second), atol=1e-5)
 
@@ -224,3 +224,28 @@ def test_eval_refuses_runs_without_a_probe_split(tmp_path):
     with pytest.raises(ValueError, match="empty probe split"):
         _load_splits(tmp_path, {})
     assert _load_splits(tmp_path, {"probe_split_fallback": "eval"})["probe"] == ["b"]
+
+
+def test_compute_parity_times_the_full_context_rollout(monkeypatch):
+    from quadwm.evaluation import protocol
+
+    monkeypatch.setattr(protocol, "training_compute", lambda run_root: {})
+    config = {"horizons": [1, 3], "compute": {"batch_size": 2, "warmup": 0, "repeats": 1}}
+    for model in (_tiny_lewm(), _tiny_baseline()):
+        if model.frozen_visual_encoder:
+            model.image_size, model.visual_encoder = 4, _TokenStub()
+        calls = []
+        rollout = model.rollout
+        monkeypatch.setattr(model, "rollout", lambda context, actions, steps, _r=rollout: (
+            calls.append((context.shape[1], steps)), _r(context, actions, steps))[1])
+        compute = protocol._compute_parity(model, config, None, torch.device("cpu"), torch.float32)
+        # EV7 must time the recurrence the eval scores: a full context_steps context, max(horizons) steps.
+        assert (model.context_steps, 3) in calls and (model.context_steps, 1) in calls
+        assert compute["single_step_latency_ms"] > 0
+
+
+class _TokenStub(torch.nn.Module):
+    """[N, 3, H, W] -> [N, 4, 8] tokens, standing in for V-JEPA."""
+
+    def forward(self, images):
+        return images.flatten(1)[:, :32].reshape(-1, 4, 8)
