@@ -59,9 +59,9 @@ class _FakeEncoder(torch.nn.Module):
 
 
 def _run(tmp_path, monkeypatch, model_cfg, observation, extra=None):
-    from quadwm.evaluation import protocol
+    from quadwm.evaluation import common, protocol
 
-    monkeypatch.setattr(protocol, "VJEPA21Encoder", _FakeEncoder)
+    monkeypatch.setattr(common, "VJEPA21Encoder", _FakeEncoder)
     data_root = tmp_path / "grandtour"
     missions = {"train": ["m-train"], "eval": ["m-eval"], "probe": ["m-probe"]}
     for seed, name in enumerate(["m-train", "m-eval", "m-probe"]):
@@ -88,6 +88,7 @@ def _run(tmp_path, monkeypatch, model_cfg, observation, extra=None):
         "batch_size": 3, "num_workers": 0, "precision": "bf16", "sigma_floor": 1e-3,
         "probe": {"kinds": ["linear", "mlp"], "hidden_dim": 256, "steps": 5, "batch_size": 32,
                   "learning_rate": 1e-3, "weight_decay": 0.0},
+        "gait": {"min_speed": 0.2, "min_segment_s": 4.0, "period_range_s": [0.3, 2.0]},
         "compute": {"enabled": True, "batch_size": 2, "warmup": 1, "repeats": 1},
     }
     result = protocol.evaluate_checkpoint(config, eval_config)

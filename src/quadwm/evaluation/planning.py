@@ -22,12 +22,15 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from ..data.grandtour import STATE_LAYOUT
+from ..data.grandtour import JOINT_ORDER, STATE_LAYOUT
 from ..sim.base import DynamicsSpec, TerrainSpec
 from ..sim.episodes import fallen, frame_images
 from ..tokens import model_inputs
+from .common import autocast
 from .probes import StateProbe
 from .rollout import rollout_latents
+
+JOINTS = len(JOINT_ORDER)  # residuals are per joint, held for every control frame of a tick
 
 
 def cem(cost, shape: tuple[int, ...], *, population: int, elites: int, iterations: int, init_std: float,
@@ -52,16 +55,16 @@ def locomotion_cost(states: Tensor, command_mps: float, weights: dict) -> Tensor
     yaw_rate = states[..., STATE_LAYOUT["ang_vel"].start + 2]
     upright = gravity.new_tensor([0.0, 0.0, -1.0])
     return (
-        float(weights.get("velocity", 1.0)) * (velocity - command_mps).pow(2).sum(1)
-        + float(weights.get("upright", 1.0)) * (gravity - upright).pow(2).sum(-1).sum(1)
-        + float(weights.get("yaw_rate", 0.1)) * yaw_rate.pow(2).sum(1)
+        float(weights["velocity"]) * (velocity - command_mps).pow(2).sum(1)
+        + float(weights["upright"]) * (gravity - upright).pow(2).sum(-1).sum(1)
+        + float(weights["yaw_rate"]) * yaw_rate.pow(2).sum(1)
     )
 
 
 @dataclass
 class Planner:
     """A frozen world model (with its frozen encoder, if any) + frozen probe, planning controller
-    residuals by CEM."""
+    residuals by CEM over ``config["horizon_ticks"]`` ticks."""
 
     model: torch.nn.Module
     probe: StateProbe
@@ -74,15 +77,11 @@ class Planner:
     precision: torch.dtype
 
     def __post_init__(self):
-        stats = {key: torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
-                 for key, value in self.normalization.items()}
-        self.stats = stats
+        self.stats = {key: torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
+                      for key, value in self.normalization.items()}
         self.context_steps = self.model.context_steps
-        self.generator = torch.Generator().manual_seed(int(self.config.get("seed", 0)))
-
-    def _autocast(self):
-        return torch.autocast(device_type=self.device.type, dtype=self.precision,
-                              enabled=self.device.type == "cuda")
+        self.horizon = int(self.config["horizon_ticks"])
+        self.generator = torch.Generator().manual_seed(int(self.config["seed"]))
 
     @torch.no_grad()
     def encode(self, observations: list[dict]) -> Tensor:
@@ -91,78 +90,106 @@ class Planner:
         images = frame_images(frames, self.modality, self.depth_size, self.depth_range)[None]
         proprio = torch.as_tensor(np.stack([o["proprio"] for o in observations]), device=self.device)[None]
         proprio = (proprio - self.stats["proprio_mean"]) / self.stats["proprio_std"]
-        with self._autocast():
+        with autocast(self.device, self.precision):
             return self.model.encode_frames(*model_inputs(self.model, {"images": images, "proprio": proprio},
                                                           self.device))
 
+    def _past_actions(self, history: list[np.ndarray], width: int) -> Tensor:
+        """The ``context_steps - 1`` actions that connect the encoded context frames."""
+        count = self.context_steps - 1
+        if len(history) < count:
+            raise ValueError(f"need {count} past actions for the model context, got {len(history)}")
+        rows = history[len(history) - count :]
+        past = np.stack(rows) if rows else np.zeros((0, width))
+        return torch.as_tensor(past, dtype=torch.float32, device=self.device)
+
     @torch.no_grad()
-    def predict_states(self, frames: Tensor, past_actions: np.ndarray, future_actions: Tensor) -> Tensor:
-        """future_actions [N, H, 120] raw targets -> probe states [N, H, 40] in raw units."""
+    def predict_states(self, frames: Tensor, action_history: list[np.ndarray], future_actions: Tensor,
+                       probe: StateProbe | None = None) -> Tensor:
+        """future_actions [N, H, 120] raw targets -> probe states [N, H, 40] in raw units.
+
+        ``action_history`` holds the raw actions taken so far (only the last
+        ``context_steps - 1`` are used); ``probe`` defaults to the planning probe.
+        """
+        probe = probe or self.probe
         count, horizon = future_actions.shape[:2]
-        past = torch.as_tensor(past_actions, dtype=torch.float32, device=self.device)[None].expand(count, -1, -1)
+        past = self._past_actions(action_history, future_actions.shape[-1])[None].expand(count, -1, -1)
         actions = torch.cat((past, future_actions.float()), dim=1)
         actions = (actions - self.stats["action_mean"]) / self.stats["action_std"]
-        with self._autocast():
+        with autocast(self.device, self.precision):
             latents = rollout_latents(self.model, frames.expand(count, *frames.shape[1:]), actions,
                                       self.context_steps, horizon)
-        probe = self.probe
         return probe.standardized(latents.float()) * probe.target_std + probe.target_mean
 
-    def plan(self, observations: list[dict], past_actions: np.ndarray, nominal: np.ndarray,
+    def plan(self, observations: list[dict], action_history: list[np.ndarray], nominal: np.ndarray,
              command_mps: float, warm_start: Tensor | None) -> Tensor:
-        """Best residual sequence [H, 12] for the controller's ``nominal`` [H, 120] continuation."""
+        """Best per-joint residual sequence [H, 12] for the controller's ``nominal`` [H, 120] continuation."""
         cfg = self.config
         frames = self.encode(observations)
         nominal_t = torch.as_tensor(nominal, dtype=torch.float32, device=self.device)
-        frames_per_tick = nominal.shape[1] // 12
+        frames_per_tick = nominal.shape[1] // JOINTS
 
         def cost(samples: Tensor) -> Tensor:
             future = nominal_t[None] + samples.repeat(1, 1, frames_per_tick)
-            states = self.predict_states(frames, past_actions, future)
-            return (locomotion_cost(states, command_mps, cfg.get("cost", {}))
-                    + float(cfg.get("residual_weight", 0.1)) * samples.pow(2).sum((1, 2)))
+            states = self.predict_states(frames, action_history, future)
+            return (locomotion_cost(states, command_mps, cfg["cost"])
+                    + float(cfg["residual_weight"]) * samples.pow(2).sum((1, 2)))
 
-        return cem(cost, nominal.shape[:1] + (12,), population=int(cfg["population"]),
+        return cem(cost, (nominal.shape[0], JOINTS), population=int(cfg["population"]),
                    elites=int(cfg["elites"]), iterations=int(cfg["iterations"]),
                    init_std=float(cfg["init_std"]), min_std=float(cfg["min_std"]),
                    clip=float(cfg["max_residual_rad"]), mean=warm_start, generator=self.generator,
                    device=self.device)
 
 
-def run_episode(sim, controller, *, planner: Planner | None, terrain: TerrainSpec, seed: int, ticks: int,
-                command_mps: float, warmup_ticks: int, success_m: float, horizon: int,
-                dynamics: DynamicsSpec = DynamicsSpec()) -> dict:
+@dataclass(frozen=True)
+class EpisodeSpec:
+    """One closed-loop control episode (the ``control_episode`` config block)."""
+
+    ticks: int
+    command_mps: float
+    warmup_ticks: int  # controller only, before the planner takes over
+    success_m: float  # forward distance that counts as traversal
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> EpisodeSpec:
+        return cls(ticks=int(cfg["ticks"]), command_mps=float(cfg["command_mps"]),
+                   warmup_ticks=int(cfg["warmup_ticks"]), success_m=float(cfg["success_m"]))
+
+
+def run_episode(sim, controller, spec: EpisodeSpec, *, terrain: TerrainSpec, seed: int,
+                planner: Planner | None = None, dynamics: DynamicsSpec = DynamicsSpec()) -> dict:
     """One closed-loop episode at 5 Hz; replans every tick when ``planner`` is given."""
     observation = sim.reset(seed=seed, terrain=terrain, dynamics=dynamics)
-    controller.command_mps = command_mps
+    controller.command_mps = spec.command_mps
     controller.reset(heading=0.0)
     context = planner.context_steps if planner is not None else 1
     history: deque = deque(maxlen=context)
-    past_actions: deque = deque(maxlen=max(context - 1, 1))
+    actions: deque = deque(maxlen=max(context - 1, 1))
     start_x = float(observation["pose_pos"][0])
     errors, warm, fell, success, tick = [], None, False, False, 0
-    for tick in range(ticks):
+    for tick in range(spec.ticks):
         history.append(observation)
         if fallen(observation):
             fell = True
             break
-        if float(observation["pose_pos"][0]) - start_x >= success_m:
+        if float(observation["pose_pos"][0]) - start_x >= spec.success_m:
             success = True
             break
         residual = None
-        if planner is not None and tick >= warmup_ticks and len(history) == context:
-            past = np.stack(past_actions)[-(context - 1):] if context > 1 else np.zeros((0, controller.frames_per_tick * 12))
-            plan = planner.plan(list(history), past, controller.nominal(observation, horizon), command_mps, warm)
+        if planner is not None and tick >= spec.warmup_ticks and len(history) == context:
+            nominal = controller.nominal(observation, planner.horizon)
+            plan = planner.plan(list(history), list(actions), nominal, spec.command_mps, warm)
             residual = plan[0].float().cpu().numpy()
             warm = torch.cat((plan[1:], torch.zeros_like(plan[:1])))  # shift for the next tick
         action = controller.act(observation, residual)
-        past_actions.append(action)
+        actions.append(action)
         observation = sim.step(action)
-        if tick >= warmup_ticks:
-            errors.append(abs(float(observation["lin_vel"][0]) - command_mps))
+        if tick >= spec.warmup_ticks:
+            errors.append(abs(float(observation["lin_vel"][0]) - spec.command_mps))
     else:  # ran out of ticks: score the final state too
         fell = fallen(observation)
-        success = not fell and float(observation["pose_pos"][0]) - start_x >= success_m
+        success = not fell and float(observation["pose_pos"][0]) - start_x >= spec.success_m
     return {
         "success": success,
         "fell": fell,

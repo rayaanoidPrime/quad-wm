@@ -85,7 +85,7 @@ def test_linear_probe_recovers_linear_state_and_is_seeded():
     generator = torch.Generator().manual_seed(0)
     latents = torch.randn(2048, 16, generator=generator)
     states = latents @ torch.randn(16, 40, generator=generator) + 5.0
-    config = {"steps": 400, "batch_size": 256, "learning_rate": 0.01, "weight_decay": 0.0}
+    config = {"hidden_dim": 256, "steps": 400, "batch_size": 256, "learning_rate": 0.01, "weight_decay": 0.0}
 
     probe, fit = fit_probe("linear", latents, states, config, seed=1, device=torch.device("cpu"))
     again, _ = fit_probe("linear", latents, states, config, seed=1, device=torch.device("cpu"))
@@ -97,7 +97,7 @@ def test_linear_probe_recovers_linear_state_and_is_seeded():
 
 def test_mlp_probe_has_protocol_architecture():
     _, fit = fit_probe("mlp", torch.randn(64, 8), torch.randn(64, 40),
-                       {"steps": 1, "batch_size": 16, "learning_rate": 1e-3, "weight_decay": 0.0},
+                       {"hidden_dim": 256, "steps": 1, "batch_size": 16, "learning_rate": 1e-3, "weight_decay": 0.0},
                        seed=0, device=torch.device("cpu"))
     assert fit["parameters"] == (8 * 256 + 256) + (256 * 256 + 256) + (256 * 40 + 40)
 
@@ -235,9 +235,12 @@ def test_compute_parity_times_the_full_context_rollout(monkeypatch):
         if model.frozen_visual_encoder:
             model.image_size, model.visual_encoder = 4, _TokenStub()
         calls = []
-        rollout = model.rollout
-        monkeypatch.setattr(model, "rollout", lambda context, actions, steps, _r=rollout: (
-            calls.append((context.shape[1], steps)), _r(context, actions, steps))[1])
+
+        def recording(context, actions, steps, _rollout=model.rollout, _calls=calls):
+            _calls.append((context.shape[1], steps))
+            return _rollout(context, actions, steps)
+
+        monkeypatch.setattr(model, "rollout", recording)
         compute = protocol._compute_parity(model, config, None, torch.device("cpu"), torch.float32)
         # EV7 must time the recurrence the eval scores: a full context_steps context, max(horizons) steps.
         assert (model.context_steps, 3) in calls and (model.context_steps, 1) in calls

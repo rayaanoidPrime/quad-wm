@@ -66,7 +66,7 @@ def fit_probe(kind: str, latents: Tensor, states: Tensor, config: dict, *, seed:
     targets = states.reshape(-1, states.shape[-1]).float()
     feature_mean, feature_std = features.mean(0), features.std(0).clamp_min(1e-6)
     target_mean, target_std = targets.mean(0), targets.std(0).clamp_min(1e-6)
-    head = build_probe(kind, features.shape[-1], targets.shape[-1], int(config.get("hidden_dim", 256)))
+    head = build_probe(kind, features.shape[-1], targets.shape[-1], int(config["hidden_dim"]))
     probe = StateProbe(head, feature_mean, feature_std, target_mean, target_std).to(device)
     features, targets = features.to(device), ((targets - target_mean) / target_std).to(device)
     steps = int(config["steps"])

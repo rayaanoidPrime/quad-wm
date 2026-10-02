@@ -641,6 +641,8 @@ class GrandTourSequenceDataset(Dataset):
         load_images: bool = True,
         depth_size: int = 64,
         depth_range: tuple[float, float] = (0.2, 10.0),
+        normalization: dict[str, list[float]] | None = None,
+        state_origin: int = 0,
     ):
         self.readers = readers
         self.depth_size, self.depth_range = depth_size, tuple(depth_range)
@@ -651,10 +653,11 @@ class GrandTourSequenceDataset(Dataset):
         self.control_hz = control_hz
         self.action_frames = action_frames
         self.load_images = load_images
-        # Set from training-split statistics (normalization_stats) by the caller.
-        self.normalization: dict[str, list[float]] | None = None
+        # Training-split statistics (normalization_stats); training sets them after
+        # computing them from this dataset.
+        self.normalization = normalization
         # Tick that base position in ``state`` is relative to (state_vectors).
-        self.state_origin = 0
+        self.state_origin = state_origin
         self.index: list[tuple[int, tuple[int, ...]]] = []
         dropped = candidates = 0
         for reader_index, reader in enumerate(readers):
@@ -706,6 +709,10 @@ class GrandTourSequenceDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.index)
+
+    def select(self, rows: list[int]) -> None:
+        """Keep only these windows (e.g. protocol anchors), in this order."""
+        self.index = [self.index[row] for row in rows]
 
     def __getitem__(self, index: int) -> dict:
         reader_index, image_ids = self.index[index]
@@ -775,6 +782,8 @@ def build_sequence_dataset(
     max_sequences: int | None = None,
     load_images: bool = True,
     missions: list[str] | str | None = None,
+    normalization: dict[str, list[float]] | None = None,
+    state_origin: int = 0,
 ) -> GrandTourSequenceDataset:
     topics = resolve_topics(observation, platform)
     selected = missions if missions is not None else data_config.get("missions")
@@ -800,6 +809,8 @@ def build_sequence_dataset(
         load_images=load_images,
         depth_size=int(data_config.get("depth_size", 64)),
         depth_range=tuple(data_config.get("depth_range", (0.2, 10.0))),
+        normalization=normalization,
+        state_origin=state_origin,
     )
 
 
