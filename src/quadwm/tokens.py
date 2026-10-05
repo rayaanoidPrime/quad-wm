@@ -18,7 +18,13 @@ from torch import Tensor
 
 def prepare_images(images: torch.Tensor, device: torch.device, size: int) -> torch.Tensor:
     batch, frames, channels, height, width = images.shape
-    images = images.to(device, non_blocking=True).div(255.0)
+    # This ROCm stack hands back an all-NaN tensor for the H2D copy of a large
+    # pinned float32 tensor (HIP pinned-allocator bug), synchronously or not.
+    # An unpinned clone is safe, so drop the pin before copying. Eval loaders
+    # pin their batches; see collect_latents.
+    if images.is_pinned():
+        images = images.clone()
+    images = images.to(device).div(255.0)
     images = images.reshape(batch * frames, channels, height, width)
     images = torch.nn.functional.interpolate(
         images, size=(size, size), mode="bilinear", align_corners=False

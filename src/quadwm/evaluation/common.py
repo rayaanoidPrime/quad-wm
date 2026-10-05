@@ -88,7 +88,8 @@ def collect_latents(model, dataset, *, context_frames: int, steps: int, batch_si
 
     ``caches`` supplies frozen-encoder tokens instead of encoding images.
     """
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True,
+    # No pin_memory: see prepare_images (large pinned tensors copy to NaN on this ROCm stack).
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False,
                         drop_last=False)
     parts: dict[str, list[Tensor]] = {"encoded": [], "predicted": [], "states": [], "mission_idx": []}
     for batch in loader:
