@@ -14,6 +14,7 @@ EV1-sim, EV2, EV3, EV4 and EV6 run in `quadwm sim-eval` (sim_protocol.py).
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -21,8 +22,8 @@ import numpy as np
 import torch
 
 from ..data import build_sequence_dataset
-from ..tokens import TokenCache, build_token_cache, cache_fits, load_token_caches, model_inputs
-from ..utils import run_metadata
+from ..tokens import model_inputs
+from ..utils import init_wandb, run_metadata
 from .common import (
     autocast,
     collect_latents,
@@ -125,27 +126,6 @@ def protocol_windows(data_cfg: dict, missions: list[str], eval_config: dict, *, 
     if not len(dataset):
         raise ValueError(f"no protocol windows in missions {missions}")
     return dataset
-
-
-def _token_caches(model, datasets: dict, cache_cfg: dict, data_root: Path, device: torch.device
-                  ) -> dict[str, list[TokenCache | None] | None]:
-    """Per-split frozen-token caches (built on first use), or None per split to encode images instead.
-
-    Same cache, settings, and keying as training, so eval reuses training's tokens.
-    """
-    if not model.frozen_visual_encoder or cache_cfg.get("mode", "auto") == "off":
-        return dict.fromkeys(datasets)
-    cache_root = Path(cache_cfg.get("root", data_root / "quadwm-token-cache"))
-    cache_root.mkdir(parents=True, exist_ok=True)
-    if not cache_fits(list(datasets.values()), cache_root, model.tokens_per_frame, model.visual_dim):
-        return dict.fromkeys(datasets)
-    caches = {}
-    for split, dataset in datasets.items():
-        build_token_cache(dataset, model.visual_encoder, cache_root, device, int(cache_cfg.get("batch_size", 16)),
-                          model.image_size)
-        dataset.load_images = False
-        caches[split] = load_token_caches(cache_root, dataset.readers, True)
-    return caches
 
 
 def _gait_cycle(readers, tick_hz: float, gait_cfg: dict) -> dict:
@@ -258,6 +238,74 @@ def training_compute(run_root: Path, max_gap_s: float = 600.0) -> dict:
             "gpu_name": metadata.get("gpu_name"), "logged_steps": len(stamps)}
 
 
+def _eval_num_workers(eval_config: dict, data_cfg: dict) -> int:
+    """DataLoader workers for eval.
+
+    Depth observations are pooled to ``data.depth_size`` in the dataset, so a
+    worker's batch stays a few MB and is safe. RGB frames stay full-resolution
+    (several MB each), and pushing them through worker processes exhausts the
+    node's shared ``/dev/shm``, so those models always load in-process.
+    """
+    return int(eval_config["num_workers"]) if "depth" in data_cfg.get("observation", "") else 0
+
+
+def _wandb_metrics(result: dict) -> dict[str, float]:
+    """Flatten the protocol result into the scalar series a W&B dashboard wants."""
+    metrics: dict[str, float] = {}
+    for split, count in result["data"]["windows"].items():
+        metrics[f"windows/{split}"] = count
+    gait = result["gait_cycle"]
+    if gait.get("seconds") is not None:
+        metrics["gait_cycle/seconds"] = gait["seconds"]
+        metrics["gait_cycle/ticks"] = gait["ticks"]
+    for kind, values in result["probes"].items():
+        for name, quality in values["quality"].items():
+            metrics[f"probe/{kind}/r2/{name}"] = quality["r2"]
+            metrics[f"probe/{kind}/pearson/{name}"] = quality["pearson"]
+        for horizon, curve in values["eps_k"].items():
+            metrics[f"eps_k/{kind}/model/{horizon}"] = curve["model"]["all"]
+            metrics[f"eps_k/{kind}/persistence/{horizon}"] = curve["persistence"]["all"]
+            metrics[f"eps_k/{kind}/encoded_floor/{horizon}"] = curve["encoded_floor"]["all"]
+    compute = result.get("compute", {})
+    for key in ("rollout_throughput_fps", "single_step_latency_ms"):
+        if compute.get(key) is not None:
+            metrics[f"compute/{key}"] = compute[key]
+    for key, value in compute.get("parameters_M", {}).items():
+        metrics[f"compute/parameters_M/{key}"] = value
+    metrics["model/epoch"] = result["model"]["epoch"]
+    metrics["model/latent_dim"] = result["model"]["latent_dim"]
+    return {
+        key: float(value)
+        for key, value in metrics.items()
+        if value is not None and np.isfinite(value)
+    }
+
+
+def _log_eval_wandb(config: dict, eval_config: dict, result: dict, run_root: Path) -> None:
+    """Log one eval to W&B as its own run in the trained model's project/group."""
+    wandb_cfg = config.get("wandb", {})
+    if not wandb_cfg.get("enabled", False):
+        print("stage=wandb status=disabled", flush=True)
+        return
+    job = os.environ.get("SLURM_JOB_ID", "local")
+    eval_run = {**config, "eval": eval_config, "wandb": {
+        **wandb_cfg,
+        "name": f"{config.get('name', 'run')}-eval-{eval_config['name']}-{job}",
+        "job_type": "eval",
+        "group": wandb_cfg.get("group", config.get("name")),
+        "tags": [*wandb_cfg.get("tags", []), f"eval-{eval_config['name']}"],
+    }}
+    run = init_wandb(eval_run, metadata=run_metadata(config), run_dir=run_root)
+    if run is None:
+        print("stage=wandb status=disabled", flush=True)
+        return
+    run.log(_wandb_metrics(result))
+    result["metadata"]["wandb_run_id"] = getattr(run, "id", None)
+    result["metadata"]["wandb_url"] = getattr(run, "url", None)
+    print(f"stage=wandb status=logged url={result['metadata']['wandb_url']}", flush=True)
+    run.finish()
+
+
 def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None = None,
                         output: Path | None = None) -> dict:
     seed = int(eval_config["seed"])
@@ -279,11 +327,14 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
                                            normalization=trained["data"].get("normalization"))
         print(f"stage=eval_windows split={split} missions={len(datasets[split].readers)} "
               f"windows={len(datasets[split])}", flush=True)
-    caches = _token_caches(model, datasets, config.get("cache", {}), Path(data_cfg["data_root"]), device)
+    # Eval always encodes images on the fly: no token cache is written (the
+    # 200 GiB storage budget is left to the training cache and data).
+    caches = dict.fromkeys(datasets)
+    num_workers = _eval_num_workers(eval_config, data_cfg)
     collected = {
         split: collect_latents(model, dataset, context_frames=context_frames,
                                steps=max(horizons) if split == "eval" else 0,
-                               batch_size=int(eval_config["batch_size"]), num_workers=int(eval_config["num_workers"]),
+                               batch_size=int(eval_config["batch_size"]), num_workers=num_workers,
                                device=device, precision=precision, caches=caches[split])
         for split, dataset in datasets.items()
     }
@@ -312,6 +363,7 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
     }
     if eval_config["compute"]["enabled"]:
         result["compute"] = _compute_parity(model, eval_config, run_root, device, precision)
+    _log_eval_wandb(config, eval_config, result, run_root)
     output = write_result(result, output, run_root, checkpoint, eval_config["name"])
     for kind, values in probes.items():
         print(f"stage=eval probe={kind} r2_all={values['quality']['all']['r2']:.3f} "

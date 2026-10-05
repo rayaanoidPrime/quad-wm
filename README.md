@@ -96,13 +96,19 @@ anchored on moments valid for the RGB *and* depth camera so both recipes are
 scored on the same data.
 
 ```bash
-# Use the CONFIG and RUN_ROOT the run trained with.
-CONFIG=configs/jepa-wm/baseline.yaml RUN_ROOT=$STORAGE_ROOT/runs/jepa-baseline   sbatch scripts/slurm/jepa_eval.sbatch
-CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth   sbatch scripts/slurm/jepa_eval.sbatch
+# One submission per model. RUN_ROOT is the run's parent dir; eval appends the
+# config's name (jepa-baseline-v2 / lewm-depth).
+CONFIG=configs/jepa-wm/baseline.yaml RUN_ROOT=$STORAGE_ROOT/runs/jepa-baseline sbatch scripts/slurm/jepa_eval.sbatch
+CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm         sbatch scripts/slurm/jepa_eval.sbatch
 
 # Aggregate across seeds and models (mean ± std, Mann-Whitney U + Holm).
 uv run quadwm report $STORAGE_ROOT/runs/*/*/eval/last-*.json --output report.md
 ```
+
+Eval encodes images on the fly and never writes a token cache, so it adds only
+the small per-run JSON under `<run_root>/<name>/eval/`. When `wandb.enabled` is
+set it also logs the probe R²/ε_k/EV7 series as a `job_type=eval` run in the
+model's project/group (name `<name>-eval-<eval config>-<job id>`).
 
 ### Simulated evals (EV1-sim, Δ_s2r, EV2, EV3, EV4, EV6)
 

@@ -25,6 +25,9 @@ windows:
   match_observations: [rgb_plus_proprioception, depth_plus_proprioception]
 
 batch_size: 8
+# Workers for models whose dataset returns pooled frames (depth). Full-res RGB
+# frames are loaded in-process regardless (protocol.py::_eval_num_workers),
+# because several-MB frames through worker processes exhaust the node /dev/shm.
 num_workers: 8
 precision: bf16
 sigma_floor: 0.001           # a component with ~0 eval-set std would otherwise divide by 0

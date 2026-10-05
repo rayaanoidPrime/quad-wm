@@ -17,7 +17,10 @@ def _expand_environment(text: str) -> str:
         name, fallback = match.groups()
         value = os.environ.get(name)
         if value is not None:
-            return value
+            # Also expand a "~" that came in through the environment (e.g.
+            # QUADWM_RUN_ROOT="~/..." passed unquoted-expanded through sbatch),
+            # so it cannot create a literal ./~ dir inside the checkout.
+            return os.path.expanduser(value)
         if fallback is not None:
             # Python never expands "~" in paths the way a shell does, so a
             # "${VAR:-~/x}" default would otherwise create a literal ./~ dir.

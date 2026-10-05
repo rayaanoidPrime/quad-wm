@@ -124,12 +124,12 @@ def test_eval_end_to_end_lewm(tmp_path, monkeypatch):
     assert written["compute"]["parameters_M"]["training_only"] > 0  # the PSG state head
 
 
-def test_eval_end_to_end_baseline_with_token_cache(tmp_path, monkeypatch):
+def test_eval_end_to_end_baseline_ignores_token_cache(tmp_path, monkeypatch):
     model_cfg = {"image_size": 32, "visual_dim": 8, "tokens_per_frame": 4, "proprio_dim": 33,
                  "proprio_embed_dim": 4, "action_dim": 120, "context_steps": 3, "rollout_context": 2,
                  "predictor_depth": 1, "predictor_heads": 2}
     extra = {"cache": {"mode": "auto", "root": str(tmp_path / "cache"), "batch_size": 4}}
     result, written = _run(tmp_path, monkeypatch, model_cfg, "rgb_plus_proprioception", extra)
     _check(result, written, latent_dim=8 + 4)
-    assert (tmp_path / "cache" / "m-eval.json").is_file()
+    assert not (tmp_path / "cache" / "m-eval.json").is_file()  # eval always encodes on the fly
     assert written["compute"]["single_step_latency_ms"] > 0
