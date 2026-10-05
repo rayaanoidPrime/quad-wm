@@ -18,6 +18,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+from ..config import run_dir
 from ..models import VJEPA21Encoder, build_model
 from ..tokens import TokenCache, model_inputs
 from .metrics import evaluation_sigma, r2_and_pearson, rollout_errors
@@ -39,8 +40,7 @@ def autocast(device: torch.device, precision: torch.dtype):
 
 def open_checkpoint(config: dict, checkpoint: Path | None, seed: int) -> tuple[Path, Path, dict, torch.device]:
     """(run_root, checkpoint path, saved checkpoint, device), seeded."""
-    # Resolved exactly like training.train, so eval finds the same run directory.
-    run_root = Path(config.get("run_root", "runs")) / config.get("name", "jepa-baseline")
+    run_root = run_dir(config)
     checkpoint = Path(checkpoint) if checkpoint else run_root / "last.pt"
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint {checkpoint} not found")

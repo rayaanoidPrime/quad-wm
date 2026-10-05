@@ -46,7 +46,7 @@ training:
   log_every_steps: 50
   eval_every_steps: 500
   eval_max_batches: 8
-  resume: ${QUADWM_RUN_ROOT:-~/quad-wm-storage/runs}/lewm-depth/last.pt
+  resume: last              # <run_root>/<name>/last.pt, so it follows `name`
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}

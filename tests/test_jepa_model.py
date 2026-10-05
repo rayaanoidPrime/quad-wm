@@ -40,9 +40,8 @@ def test_jepa_evaluate_reports_per_step_persistence_and_variance():
     )
 
     metrics = model.evaluate(
-        torch.randn(2, 4, 4, 8),
-        torch.randn(2, 4, 33),
-        torch.randn(2, 3, 6),
+        {"proprio": torch.randn(2, 4, 33), "actions": torch.randn(2, 3, 6)},
+        visual_tokens=torch.randn(2, 4, 4, 8),
     )
 
     for step in (1, 2):

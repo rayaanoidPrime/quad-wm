@@ -167,7 +167,8 @@ class LeWorldModel(nn.Module):
             frames = torch.cat((frames, following[:, None]), dim=1)
         return frames[:, context.shape[1] :]
 
-    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    def forward(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> dict[str, Tensor]:
+        """Training losses; ``visual_tokens`` is ignored (no frozen encoder)."""
         proprio, actions = batch["proprio"], batch["actions"]
         z = self.encode(batch["images"], proprio)
         losses = {
@@ -191,8 +192,8 @@ class LeWorldModel(nn.Module):
         return losses
 
     @torch.no_grad()
-    def evaluate(self, batch: dict[str, Tensor]) -> dict[str, float]:
-        """E1.1: per-step open-loop error vs persistence, plus collapse signatures."""
+    def evaluate(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> dict[str, float]:
+        """E1.1: per-step open-loop error vs persistence, plus collapse signatures; ``visual_tokens`` is ignored."""
         z = self.encode(batch["images"], batch["proprio"])
         future = self.rollout(z[:, : self.context_steps], batch["actions"], self.rollout_steps)
         targets, last = z[:, self.context_steps :], z[:, self.context_steps - 1 : self.context_steps]

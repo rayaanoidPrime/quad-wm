@@ -207,7 +207,8 @@ class JEPAWorldModel(nn.Module):
 
     Track 1 model interface (shared with LeWorldModel, used by every eval):
     ``encode_frames``, ``rollout``, ``probe_latent``, ``training_only_modules``,
-    ``frame_shape``, and the attributes ``frozen_visual_encoder``,
+    ``frame_shape``, ``forward`` (training losses) and ``evaluate`` (E1.1
+    metrics), both ``(batch, visual_tokens=None)``, and the attributes ``frozen_visual_encoder``,
     ``image_channels``, ``image_size``, ``context_steps``, ``action_dim``,
     ``proprio_dim``.
     """
@@ -275,12 +276,16 @@ class JEPAWorldModel(nn.Module):
     def frame_shape(self) -> tuple[int, ...]:
         return (self.tokens_per_frame, self.model_dim)
 
+    def _visual_tokens(self, batch: dict[str, Tensor], visual_tokens: Tensor | None) -> Tensor:
+        """Frozen tokens [B, T, N, Dv]: ``visual_tokens`` if given, else V-JEPA on prepared ``batch["images"]``."""
+        if visual_tokens is not None:
+            return visual_tokens
+        images = batch["images"]  # [B, T, C, H, W], already prepared for V-JEPA
+        return self.encode_visual(images.flatten(0, 1)).unflatten(0, images.shape[:2])
+
     def encode_frames(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> Tensor:
         """Observation tokens [B, T, N, D] from frozen ``visual_tokens`` (or prepared ``batch["images"]``)."""
-        if visual_tokens is None:
-            images = batch["images"]  # [B, T, C, H, W], already prepared for V-JEPA
-            visual_tokens = self.encode_visual(images.flatten(0, 1)).unflatten(0, images.shape[:2])
-        return self.encode_observation(visual_tokens, batch["proprio"])
+        return self.encode_observation(self._visual_tokens(batch, visual_tokens), batch["proprio"])
 
     def predict_next(self, context: Tensor, actions: Tensor) -> Tensor:
         action = self.action_encoder(actions) # [B, T , 784]
@@ -357,15 +362,14 @@ class JEPAWorldModel(nn.Module):
         return losses
 
     @torch.no_grad()
-    def evaluate(
-        self, visual_tokens: Tensor, proprio: Tensor, actions: Tensor
-    ) -> dict[str, float]:
+    def evaluate(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> dict[str, float]:
         """E1.1 metrics: per-rollout-step error, persistence baseline, proprio variance.
 
         Persistence predicts the context's last observation for every future step
         (the gate the predictor must beat on held-out missions).
         """
-        observations = self.encode_observation(visual_tokens, proprio)
+        observations = self.encode_frames(batch, visual_tokens)
+        actions = batch["actions"]
         context_steps = self.context_steps
         steps = actions.shape[1] - (context_steps - 1)
         predictions = self.rollout(observations[:, :context_steps], actions, steps)
@@ -397,15 +401,5 @@ class JEPAWorldModel(nn.Module):
         )
         return metrics
 
-    def training_step(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        if "visual_tokens" in batch:
-            visual_tokens = batch["visual_tokens"]
-        else: 
-            images = batch["images"]  # (B,T,C,H,W)
-            batch_size, frames = images.shape[:2] 
-            visual_tokens = self.encode_visual(images.reshape(batch_size * frames, *images.shape[2:])) # vjepa21( [B*T, C, H, W]) -> [BT, 576, 768]
-            visual_tokens = visual_tokens.reshape(batch_size, frames, *visual_tokens.shape[1:]) # [B, T, 576, 768]
-        return self.loss(visual_tokens, batch["proprio"], batch["actions"])
-
-    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        return self.training_step(batch)
+    def forward(self, batch: dict[str, Tensor], visual_tokens: Tensor | None = None) -> dict[str, Tensor]:
+        return self.loss(self._visual_tokens(batch, visual_tokens), batch["proprio"], batch["actions"])

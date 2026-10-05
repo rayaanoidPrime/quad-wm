@@ -272,3 +272,28 @@ def test_perturbed_replays_restore_rendering_even_on_failure():
         _perturbed_replays(sim, build_controller(SIM_CONFIG), cfg, TerrainSpec(), 0, warmup=2, steps=3,
                            rng=np.random.default_rng(0))
     assert sim.rendering, "a failed replay must not leave rendering off for the next eval"
+
+
+def test_referenced_configs_resolve_next_to_the_referencing_config(tmp_path, monkeypatch):
+    """protocol_config / sim_config / data_config work from any working directory."""
+    from quadwm.config import referenced_path
+
+    (tmp_path / "eval").mkdir()
+    (tmp_path / "eval" / "protocol.yaml").write_text("name: p\n", encoding="utf-8")
+    (tmp_path / "eval" / "sim.yaml").write_text("protocol_config: protocol.yaml\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+    sim_eval = load_config(tmp_path / "eval" / "sim.yaml")
+    assert load_config(referenced_path(sim_eval, sim_eval["protocol_config"]))["name"] == "p"
+    with pytest.raises(FileNotFoundError):
+        referenced_path(sim_eval, "missing.yaml")
+
+
+def test_ev4_grid_refuses_compounds_that_would_overwrite_each_other():
+    from quadwm.evaluation.sim_protocol import _dynamics_grid
+
+    cfg = {"mass_percent": [], "friction_scale": [], "latency_ms": [],
+           "compound": [{"mass_percent": 30, "friction_scale": 2.5, "latency_ms": 50},
+                        {"mass_percent": 30, "friction_scale": 0.4, "latency_ms": 10}]}
+    with pytest.raises(ValueError, match="distinct mass_percent"):
+        _dynamics_grid(cfg)
+    assert len(_dynamics_grid(cfg | {"compound": cfg["compound"][:1]})) == 2  # nominal + one compound

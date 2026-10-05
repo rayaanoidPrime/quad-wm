@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -89,3 +90,72 @@ def test_token_cache_rebuild_keeps_previously_cached_ids(tmp_path):
     metadata = json.loads((tmp_path / "mission-a.json").read_text(encoding="utf-8"))
     assert metadata["image_ids"] == [0, 1, 2, 3, 4]
     assert metadata["shape"] == [5, 4, 8]
+
+
+def test_run_log_writes_the_metrics_jsonl_schema_eval_reads(tmp_path):
+    """protocol.training_compute reads step timestamps from metrics.jsonl (EV7 GPU-hours)."""
+    from quadwm.training import _RunLog
+
+    class _Wandb:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, values, step):
+            self.logged.append((values, step))
+
+        def finish(self):
+            pass
+
+    wandb_run = _Wandb()
+    log = _RunLog(tmp_path, wandb_run, enabled=True)
+    log.record({"loss": 1.0, "epoch": 0}, 1, to_wandb=False)
+    log.record({"eval/visual_mse": 2.0}, 1)
+    log.close()
+
+    lines = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [set(line) for line in lines] == [{"loss", "epoch", "step", "timestamp"},
+                                             {"eval/visual_mse", "step", "timestamp"}]
+    assert wandb_run.logged == [({"eval/visual_mse": 2.0}, 1)]
+    assert not (tmp_path / "other").exists()
+    _RunLog(tmp_path / "other", None, enabled=False).record({"loss": 1.0}, 1)  # non-zero ranks write nothing
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")  # CUDA autocast is disabled on CPU-only hosts
+def test_held_out_eval_drives_both_models_through_one_interface():
+    from quadwm.models import JEPAWorldModel, LeWorldModel
+    from quadwm.training import _evaluate
+
+    lewm = LeWorldModel(image_size=16, patch_size=8, encoder_dim=16, encoder_depth=1, encoder_heads=2,
+                        latent_dim=8, predictor_dim=16, predictor_depth=1, predictor_heads=2,
+                        predictor_window=2, proprio_dim=33, action_dim=6, context_steps=2,
+                        rollout_steps=1, sigreg_slices=8)
+    jepa = JEPAWorldModel(visual_dim=8, proprio_dim=33, proprio_embed_dim=4, action_dim=6, tokens_per_frame=4,
+                          predictor_depth=1, predictor_heads=2, context_steps=2, rollout_context=2)
+
+    class _Cache:
+        def get(self, image_ids):
+            return np.ones((*image_ids.shape, 4, 8), dtype=np.float16)
+
+    batch = {"proprio": torch.randn(2, 3, 33), "actions": torch.randn(2, 2, 6), "images": torch.rand(2, 3, 2, 16, 16),
+             "mission_idx": torch.zeros(2, dtype=torch.long), "image_ids": torch.arange(6).view(2, 3)}
+    cpu = torch.device("cpu")
+    lewm_metrics = _evaluate(lewm.train(), [dict(batch)], None, cpu, torch.bfloat16, max_batches=1)
+    jepa_metrics = _evaluate(jepa, [dict(batch)], [_Cache()], cpu, torch.bfloat16, max_batches=1)
+
+    assert "step_1/persistence_mse" in lewm_metrics and lewm.training  # training mode restored
+    assert "step_1/persistence_visual_mse" in jepa_metrics
+    # forward is the training loss for both, with the same (batch, visual_tokens) signature
+    tokens = torch.ones(2, 3, 4, 8)
+    assert torch.equal(jepa(batch, tokens)["loss"], jepa.loss(tokens, batch["proprio"], batch["actions"])["loss"])
+
+
+def test_resume_last_follows_the_run_name(tmp_path):
+    """``resume: last`` cannot point at another run's checkpoint after ``name`` is bumped."""
+    from quadwm.training import _resume_path
+
+    config = {"run_root": str(tmp_path), "name": "jepa-baseline-v3", "training": {"resume": "last"}}
+    assert _resume_path(config) == tmp_path / "jepa-baseline-v3" / "last.pt"
+    config["training"]["resume"] = "elsewhere/last.pt"
+    assert _resume_path(config) == Path("elsewhere/last.pt")
+    config["training"]["resume"] = ""
+    assert _resume_path(config) is None

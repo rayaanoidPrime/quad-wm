@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from ..config import checkpoint_dir, data_dir
 from ..data import build_sequence_dataset
 from ..tokens import model_inputs
 from ..utils import init_wandb, run_metadata
@@ -66,7 +67,7 @@ def _load_splits(run_root: Path, eval_config: dict) -> dict[str, list[str]]:
 
 def _window_dataset(data_cfg: dict, missions: list[str], eval_config: dict, *, observation: str,
                     load_images: bool, normalization: dict | None = None):
-    data_root = Path(data_cfg.get("data_root", "data/grandtour"))
+    data_root = Path(data_cfg["data_root"])
     context_frames = int(eval_config["context_frames"])
     try:
         return build_sequence_dataset(
@@ -312,6 +313,7 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
     run_root, checkpoint, saved, device = open_checkpoint(config, checkpoint, seed)
     trained = saved["config"]
     data_cfg = dict(config["data"])  # paths from this machine; transforms from the checkpoint
+    data_cfg["data_root"] = str(data_dir(config))
     data_cfg["observation"] = trained["data"]["observation"]
     splits = _load_splits(run_root, eval_config)
     horizons = sorted(int(k) for k in eval_config["horizons"])
@@ -320,7 +322,7 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
     print(f"stage=eval status=starting checkpoint={checkpoint} epoch={saved.get('epoch')} "
           f"device={device} horizons={horizons}", flush=True)
 
-    model = load_model(saved, Path(config.get("checkpoint_root", "checkpoints"))).to(device).eval()
+    model = load_model(saved, checkpoint_dir(config)).to(device).eval()
     datasets = {}
     for split in ("probe", "eval"):
         datasets[split] = protocol_windows(data_cfg, splits[split], eval_config, load_images=True,
@@ -329,13 +331,12 @@ def evaluate_checkpoint(config: dict, eval_config: dict, checkpoint: Path | None
               f"windows={len(datasets[split])}", flush=True)
     # Eval always encodes images on the fly: no token cache is written (the
     # 200 GiB storage budget is left to the training cache and data).
-    caches = dict.fromkeys(datasets)
     num_workers = _eval_num_workers(eval_config, data_cfg)
     collected = {
         split: collect_latents(model, dataset, context_frames=context_frames,
                                steps=max(horizons) if split == "eval" else 0,
                                batch_size=int(eval_config["batch_size"]), num_workers=num_workers,
-                               device=device, precision=precision, caches=caches[split])
+                               device=device, precision=precision)
         for split, dataset in datasets.items()
     }
     mission_names = [reader.mission_dir.name for reader in datasets["eval"].readers]

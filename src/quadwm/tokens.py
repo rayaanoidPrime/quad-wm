@@ -178,10 +178,8 @@ def cached_tokens(batch: dict, caches: list[TokenCache | None], device: torch.de
     return torch.from_numpy(np.stack(rows)).to(device, non_blocking=True)
 
 
-def load_token_caches(cache_root: Path, readers, use_cache: bool) -> list[TokenCache | None]:
+def load_token_caches(cache_root: Path, readers) -> list[TokenCache | None]:
     """Per-mission caches, aligned with reader order; None where nothing was cached."""
-    if not use_cache:
-        return []
     return [
         TokenCache(cache_root, reader.mission_dir.name)
         if (cache_root / f"{reader.mission_dir.name}.json").is_file()

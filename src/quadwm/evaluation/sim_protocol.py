@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..config import load_config
+from ..config import checkpoint_dir, load_config, referenced_path
 from ..data.grandtour import state_vectors
 from ..sim import DynamicsSpec, TerrainSpec, build_simulator
 from ..sim.controller import build_controller
@@ -202,7 +202,10 @@ def _dynamics_grid(cfg: dict) -> dict[str, DynamicsSpec]:
     for latency in cfg["latency_ms"]:
         grid[f"latency{latency:g}ms"] = DynamicsSpec(latency_ms=float(latency))
     for compound in cfg["compound"]:
-        grid[f"compound_mass{compound['mass_percent']:+g}%"] = DynamicsSpec(
+        name = f"compound_mass{compound['mass_percent']:+g}%"
+        if name in grid:  # the name carries only the mass shift; a second one would overwrite the first
+            raise ValueError(f"ev4.compound conditions need distinct mass_percent; {name} repeats")
+        grid[name] = DynamicsSpec(
             base_mass_scale=1 + compound["mass_percent"] / 100, friction_scale=float(compound["friction_scale"]),
             latency_ms=float(compound["latency_ms"]))
     return grid
@@ -249,7 +252,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
     if unknown := only - set(EVALS):
         raise ValueError(f"unknown evals {sorted(unknown)}; choose from {EVALS}")
     # Horizons, context, probe procedure, sigma floor: the real-data eval's, so EV1-sim pairs with EV5.
-    protocol_cfg = load_config(Path(sim_eval_config["protocol_config"]))
+    protocol_cfg = load_config(referenced_path(sim_eval_config, sim_eval_config["protocol_config"]))
     seed = int(sim_eval_config["seed"])
     run_root, checkpoint, saved, device = open_checkpoint(config, checkpoint, seed)
     data_cfg = saved["config"]["data"]
@@ -258,13 +261,13 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
     precision = precision_dtype(protocol_cfg["precision"])
     horizons = sorted(int(k) for k in protocol_cfg["horizons"])
     context_frames = int(protocol_cfg["context_frames"])
-    sim_cfg = load_config(Path(sim_eval_config["sim_config"]))["sim"]
+    sim_cfg = load_config(referenced_path(sim_eval_config, sim_eval_config["sim_config"]))["sim"]
     controller_cfg = sim_eval_config["controller"]
 
     def controller_factory():
         return build_controller(sim_cfg, controller_cfg)
 
-    model = load_model(saved, Path(config.get("checkpoint_root", "checkpoints"))).to(device).eval()
+    model = load_model(saved, checkpoint_dir(config)).to(device).eval()
     depth_size, depth_range = int(data_cfg.get("depth_size", 64)), tuple(data_cfg.get("depth_range", (0.2, 10.0)))
     print(f"stage=sim_eval status=starting checkpoint={checkpoint} modality={modality} evals={sorted(only)}",
           flush=True)
@@ -336,7 +339,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
 
 def collect_episodes(sim_eval_config: dict) -> dict[str, list[Path]]:
     """Render and cache the EV1-sim episodes without a model (`quadwm sim-collect`, CPU only)."""
-    sim_cfg = load_config(Path(sim_eval_config["sim_config"]))["sim"]
+    sim_cfg = load_config(referenced_path(sim_eval_config, sim_eval_config["sim_config"]))["sim"]
     controller_cfg = sim_eval_config["controller"]
     return {split: episode_set(lambda: build_simulator(_rendered(sim_cfg, ["rgb", "depth"])),
                                lambda: build_controller(sim_cfg, controller_cfg),

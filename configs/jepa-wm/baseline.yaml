@@ -41,8 +41,9 @@ training:
   log_every_steps: 10
   eval_every_steps: 200
   eval_max_batches: 8
-  # Stable path so a job killed at the walltime resumes the next submission.
-  resume: ${QUADWM_RUN_ROOT:-~/quad-wm-storage/runs}/jepa-baseline-v2/last.pt
+  # Resume this run's own last.pt, so a job killed at the walltime continues
+  # on the next submission. An explicit path also works; "" starts fresh.
+  resume: last              # <run_root>/<name>/last.pt, so it follows `name`
 
 wandb:
   enabled: ${QUADWM_WANDB_ENABLED:-true}

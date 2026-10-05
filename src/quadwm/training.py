@@ -15,6 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+from .config import checkpoint_dir, data_dir, run_dir
 from .data import (
     build_sequence_dataset,
     fetch_missions,
@@ -23,8 +24,8 @@ from .data import (
     split_mission_names,
     verify_joint_order_consistency,
 )
+from .data.grandtour import GrandTourSequenceDataset
 from .models import (
-    LeWorldModel,
     VJEPA21Encoder,
     build_model,
     ensure_vjepa21_checkpoint,
@@ -32,15 +33,7 @@ from .models import (
     model_class,
     save_checkpoint,
 )
-from .tokens import (
-    TokenCache,
-    build_token_cache,
-    cache_fits,
-    cached_tokens,
-    frozen_tokens,
-    load_token_caches,
-    prepare_images,
-)
+from .tokens import TokenCache, build_token_cache, cache_fits, load_token_caches, model_inputs
 from .utils import init_wandb, run_metadata
 
 
@@ -78,38 +71,34 @@ def _seed(seed: int, rank: int) -> None:
     torch.cuda.manual_seed_all(value)
 
 
-def _from_scratch(config: dict) -> bool:
-    """True for the end-to-end model: no frozen V-JEPA encoder, checkpoint, or token cache."""
-    return not model_class(config["model"]).frozen_visual_encoder
+def _frozen_encoder(config: dict) -> bool:
+    """True for the V-JEPA baseline (frozen encoder, checkpoint, token cache); False end to end."""
+    return model_class(config["model"]).frozen_visual_encoder
+
+
+def _write_json(path: Path, value, **kwargs) -> None:
+    path.write_text(json.dumps(value, **kwargs) + "\n", encoding="utf-8")
 
 
 @torch.no_grad()
 def _evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
-    caches: list[TokenCache | None],
+    caches: list[TokenCache | None] | None,
     device: torch.device,
     precision: torch.dtype,
-    use_cache: bool,
     max_batches: int,
 ) -> dict[str, float]:
     """Held-out E1.1 pass: per-step error, persistence baseline, proprio variance."""
-    module = model.module if hasattr(model, "module") else model
+    module = getattr(model, "module", model)  # unwrap DDP
     was_training = module.training
     module.eval()
     totals: dict[str, float] = {}
     batches = 0
     for batch in loader:
-        if isinstance(module, LeWorldModel):
-            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-            with torch.autocast(device_type="cuda", dtype=precision):
-                metrics = module.evaluate(batch)
-        else:
-            visual_tokens = frozen_tokens(model, batch, device, caches if use_cache else None)
-            batch["proprio"] = batch["proprio"].to(device, non_blocking=True)
-            batch["actions"] = batch["actions"].to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=precision):
-                metrics = module.evaluate(visual_tokens, batch["proprio"], batch["actions"])
+        inputs, visual_tokens = model_inputs(module, batch, device, caches)
+        with torch.autocast(device_type="cuda", dtype=precision):
+            metrics = module.evaluate(inputs, visual_tokens)
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
         batches += 1
@@ -149,10 +138,10 @@ def prepare(config: dict) -> Path | None:
     again from ``train`` on the same job.
     """
     print("stage=prepare status=starting", flush=True)
-    checkpoint_root = Path(config.get("checkpoint_root", "checkpoints")) # STORAGE_ROOT/checkpoints
+    checkpoint_root = checkpoint_dir(config)  # STORAGE_ROOT/checkpoints
     data_cfg = config.get("data", {})
     if data_cfg.get("download", True):
-        data_root = Path(data_cfg.get("data_root", config.get("data_root", "data/grandtour")))
+        data_root = data_dir(config)
         print(
             f"stage=data status=ensuring root={data_root} "
             f"missions={data_cfg.get('missions', 'all')}",
@@ -165,44 +154,28 @@ def prepare(config: dict) -> Path | None:
         )
         print("stage=data status=ready", flush=True)
     checkpoint = None
-    if not _from_scratch(config):
+    if _frozen_encoder(config):
         checkpoint = ensure_vjepa21_checkpoint(checkpoint_root)
         print(f"stage=checkpoint status=ready path={checkpoint}", flush=True)
     print("stage=prepare status=complete", flush=True)
     return checkpoint
 
 
-def train(config: dict) -> None:
-    rank, world_size, local_rank, device = _distributed(
-        float(config["training"].get("min_free_gpu_fraction", 0.5))
-    )
-    _seed(int(config.get("seed", 4551)), rank)
-    if rank == 0:
-        print(
-            f"stage=train status=starting device={torch.cuda.get_device_name(device)} "
-            f"world_size={world_size}",
-            flush=True,
-        )
-    run_root = Path(config.get("run_root", "runs")) / config.get("name", "jepa-baseline")
-    checkpoint_root = Path(config.get("checkpoint_root", "checkpoints"))
+def _resolve_splits(
+    config: dict, run_root: Path, rank: int
+) -> tuple[list[str] | None, list[str] | None]:
+    """(train, eval) missions; rank 0 records the split in ``splits.json`` for the protocol eval.
+
+    ``None`` train missions means every configured mission; ``None`` eval
+    missions means no held-out evaluation.
+    """
     data_cfg = config["data"]
-    data_root = Path(data_cfg.get("data_root", config.get("data_root", "data/grandtour")))
-
-    model_cfg = config["model"]
-    if rank == 0:
-        run_root.mkdir(parents=True, exist_ok=True)
-        (run_root / "resolved_config.json").write_text(
-            json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8"
-        )
-        prepare(config)
-    _barrier()
-
     eval_fraction = float(data_cfg.get("eval_fraction", 0.0))
     train_missions = data_cfg.get("missions")
     eval_missions: list[str] | None = data_cfg.get("eval_missions")
     probe_missions: list[str] = data_cfg.get("probe_missions", [])
     if eval_missions is None and eval_fraction > 0:
-        available = materialized_missions(data_root, data_cfg.get("missions"))
+        available = materialized_missions(data_dir(config), data_cfg.get("missions"))
         if len(available) >= 2:
             # Probe-fit missions are never trained on (shared protocol §1.3 rule 4).
             train_missions, eval_missions, probe_missions = split_mission_names(
@@ -226,22 +199,37 @@ def train(config: dict) -> None:
             flush=True,
         )
         splits = {"train": train_missions, "eval": eval_missions, "probe": probe_missions}
-        (run_root / "splits.json").write_text(json.dumps(splits, indent=2) + "\n", encoding="utf-8")
+        _write_json(run_root / "splits.json", splits, indent=2)
+    return train_missions, eval_missions
 
-    dataset = build_sequence_dataset(
+
+def _sequence_dataset(
+    config: dict, missions: list[str] | None, max_sequences: int | None
+) -> GrandTourSequenceDataset:
+    data_cfg, model_cfg = config["data"], config["model"]
+    return build_sequence_dataset(
         data_cfg,
         observation=data_cfg["observation"],
         platform=data_cfg["platform"],
-        data_root=data_root,
+        data_root=data_dir(config),
         context_steps=int(model_cfg["context_steps"]),
         rollout_steps=int(model_cfg["rollout_steps"]),
         tick_hz=float(data_cfg["tick_hz"]),
         control_hz=float(data_cfg["control_hz"]),
         action_frames=int(data_cfg["action_frames"]),
-        max_sequences=data_cfg.get("max_sequences"),
+        max_sequences=max_sequences,
         load_images=True,
-        missions=train_missions,
+        missions=missions,
     )
+
+
+def _build_datasets(
+    config: dict, run_root: Path, rank: int
+) -> tuple[GrandTourSequenceDataset, GrandTourSequenceDataset | None]:
+    """Checked train and held-out datasets, normalized with training-split statistics."""
+    data_cfg = config["data"]
+    train_missions, eval_missions = _resolve_splits(config, run_root, rank)
+    dataset = _sequence_dataset(config, train_missions, data_cfg.get("max_sequences"))
     _check_dataset(dataset, data_cfg, name="sequence")
     if data_cfg.get("normalize", True):
         # Training-split statistics only; eval data reuses them. Stored in the
@@ -249,71 +237,54 @@ def train(config: dict) -> None:
         data_cfg["normalization"] = normalization_stats(dataset.readers, int(data_cfg["action_frames"]))
         dataset.normalization = data_cfg["normalization"]
         if rank == 0:
-            (run_root / "normalization.json").write_text(
-                json.dumps(data_cfg["normalization"]) + "\n", encoding="utf-8"
-            )
+            _write_json(run_root / "normalization.json", data_cfg["normalization"])
     if rank == 0:
         print(
             f"stage=dataset status=ready missions={len(dataset.readers)} "
             f"sequences={len(dataset)}",
             flush=True,
         )
-
-    eval_dataset = None
-    if eval_missions:
-        eval_dataset = build_sequence_dataset(
-            data_cfg,
-            observation=data_cfg["observation"],
-            platform=data_cfg["platform"],
-            data_root=data_root,
-            context_steps=int(model_cfg["context_steps"]),
-            rollout_steps=int(model_cfg["rollout_steps"]),
-            tick_hz=float(data_cfg["tick_hz"]),
-            control_hz=float(data_cfg["control_hz"]),
-            action_frames=int(data_cfg["action_frames"]),
-            max_sequences=data_cfg.get("eval_max_sequences"),
-            load_images=True,
-            missions=eval_missions,
+    if not eval_missions:
+        return dataset, None
+    eval_dataset = _sequence_dataset(config, eval_missions, data_cfg.get("eval_max_sequences"))
+    _check_dataset(eval_dataset, data_cfg, name="held-out eval", check_drop_rate=False)
+    eval_dataset.normalization = data_cfg.get("normalization")
+    if rank == 0:
+        print(
+            f"stage=eval_dataset status=ready missions={len(eval_dataset.readers)} "
+            f"sequences={len(eval_dataset)}",
+            flush=True,
         )
-        _check_dataset(eval_dataset, data_cfg, name="held-out eval", check_drop_rate=False)
-        eval_dataset.normalization = data_cfg.get("normalization")
-        if rank == 0:
-            print(
-                f"stage=eval_dataset status=ready missions={len(eval_dataset.readers)} "
-                f"sequences={len(eval_dataset)}",
-                flush=True,
-            )
+    return dataset, eval_dataset
 
-    cache_cfg = config.get("cache", {})
-    use_cache = cache_cfg.get("mode", "auto") != "off" and not _from_scratch(config)
-    cache_root = Path(cache_cfg.get("root", data_root / "quadwm-token-cache"))
+
+def _token_cache(
+    config: dict, datasets: list[GrandTourSequenceDataset], device: torch.device, rank: int, world_size: int
+) -> Path | None:
+    """Rank 0 builds the frozen-encoder token cache when enabled and it fits on disk.
+
+    Every rank agrees on the outcome and stops loading images when it is
+    used. Returns the cache root, or None when training encodes on the fly
+    (or the model has no frozen encoder).
+    """
+    cache_cfg, model_cfg = config.get("cache", {}), config["model"]
+    cache_root = Path(cache_cfg.get("root", data_dir(config) / "quadwm-token-cache"))
     cache_root.parent.mkdir(parents=True, exist_ok=True)
-    image_size = int(model_cfg.get("image_size", 384))
+    use_cache = cache_cfg.get("mode", "auto") != "off" and _frozen_encoder(config)
     if use_cache and rank == 0:
         use_cache = cache_fits(
-            [dataset] + ([eval_dataset] if eval_dataset is not None else []),
-            cache_root,
-            tokens=int(model_cfg["tokens_per_frame"]),
-            dim=int(model_cfg["visual_dim"]),
+            datasets, cache_root, tokens=int(model_cfg["tokens_per_frame"]), dim=int(model_cfg["visual_dim"])
         )
         if use_cache:
-            encoder = VJEPA21Encoder(checkpoint_root)
-            build_token_cache(
-                dataset,
-                encoder,
-                cache_root,
-                device,
-                int(cache_cfg.get("batch_size", 16)),
-                image_size,
-            )
-            if eval_dataset is not None:
+            encoder = VJEPA21Encoder(checkpoint_dir(config))
+            for dataset in datasets:
                 build_token_cache(
-                    eval_dataset,
+                    dataset,
                     encoder,
                     cache_root,
                     device,
                     int(cache_cfg.get("batch_size", 16)),
-                    image_size,
+                    int(model_cfg.get("image_size", 384)),
                 )
             del encoder
             torch.cuda.empty_cache()
@@ -324,20 +295,97 @@ def train(config: dict) -> None:
     _barrier()
     if rank == 0:
         print(f"stage=feature_cache status={'enabled' if use_cache else 'disabled'}", flush=True)
-    dataset.load_images = not use_cache
-    caches = load_token_caches(cache_root, dataset.readers, use_cache)
-    eval_loader = None
-    eval_caches: list[TokenCache | None] = []
-    if eval_dataset is not None:
-        eval_dataset.load_images = not use_cache
-        eval_caches = load_token_caches(cache_root, eval_dataset.readers, use_cache)
-        eval_loader = eval_dataset.loader(
-            batch_size=int(config["training"].get("per_gpu_batch_size", 1)),
-            shuffle=False,
-            num_workers=0,
+    for dataset in datasets:
+        dataset.load_images = not use_cache
+    return cache_root if use_cache else None
+
+
+def _resume_path(config: dict) -> Path | None:
+    """``training.resume``: ``last`` is this run's own ``last.pt``; any other value is a path; empty is none."""
+    value = config["training"].get("resume")
+    if not value:
+        return None
+    return run_dir(config) / "last.pt" if value == "last" else Path(value)
+
+
+def _resume(resume_path: Path | None, model, optimizer, rank: int) -> int:
+    """Epoch to start from: the checkpoint's when ``resume_path`` exists, else 0."""
+    if resume_path is not None and resume_path.is_file():
+        start_epoch = load_checkpoint(resume_path, model=model, optimizer=optimizer)
+        if rank == 0:
+            print(f"stage=resume status=loaded path={resume_path} epoch={start_epoch}", flush=True)
+        return start_epoch
+    if rank == 0 and resume_path is not None:
+        print(f"stage=resume status=fresh no_checkpoint={resume_path}", flush=True)
+    return 0
+
+
+def _start_wandb(config: dict, run_root: Path, metadata: dict):
+    """Rank 0 only: start W&B (when enabled) and write ``run_metadata.json``."""
+    wandb_run = init_wandb(config, metadata=metadata, run_dir=run_root)
+    if wandb_run is None:
+        print("stage=wandb status=disabled", flush=True)
+    else:
+        print(f"stage=wandb status=started url={getattr(wandb_run, 'url', None)}", flush=True)
+        metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
+        metadata["wandb_url"] = getattr(wandb_run, "url", None)
+    _write_json(run_root / "run_metadata.json", metadata, indent=2)
+    return wandb_run
+
+
+class _RunLog:
+    """Rank-0 sink for ``metrics.jsonl`` and W&B; a no-op on other ranks."""
+
+    def __init__(self, run_root: Path, wandb_run, enabled: bool):
+        self.stream = (run_root / "metrics.jsonl").open("a", encoding="utf-8") if enabled else None
+        self.wandb_run = wandb_run
+
+    def record(self, values: dict, step: int, *, to_wandb: bool = True) -> None:
+        if self.stream is not None:
+            self.stream.write(json.dumps(values | {"step": step, "timestamp": time.time()}) + "\n")
+            self.stream.flush()
+        if to_wandb and self.wandb_run is not None:
+            # Explicit global step so the W&B x-axis matches training
+            # progress instead of W&B's internal log counter.
+            self.wandb_run.log(values, step=step)
+
+    def close(self) -> None:
+        if self.stream is not None:
+            self.stream.close()
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+
+
+def train(config: dict) -> None:
+    train_cfg = config["training"]
+    rank, world_size, local_rank, device = _distributed(float(train_cfg.get("min_free_gpu_fraction", 0.5)))
+    _seed(int(config.get("seed", 4551)), rank)
+    if rank == 0:
+        print(
+            f"stage=train status=starting device={torch.cuda.get_device_name(device)} "
+            f"world_size={world_size}",
+            flush=True,
         )
-    visual_encoder = None if use_cache or _from_scratch(config) else VJEPA21Encoder(checkpoint_root)
-    model = build_model(model_cfg, checkpoint_root, visual_encoder=visual_encoder).to(device)
+    run_root = run_dir(config)
+    if rank == 0:
+        run_root.mkdir(parents=True, exist_ok=True)
+        _write_json(run_root / "resolved_config.json", config, indent=2, default=str)
+        prepare(config)
+    _barrier()
+
+    dataset, eval_dataset = _build_datasets(config, run_root, rank)
+    cache_root = _token_cache(config, [dataset] + ([eval_dataset] if eval_dataset else []), device, rank, world_size)
+    caches = load_token_caches(cache_root, dataset.readers) if cache_root else None
+    batch_size = int(train_cfg.get("per_gpu_batch_size", 1))
+    eval_loader = eval_caches = None
+    if eval_dataset is not None:
+        eval_caches = load_token_caches(cache_root, eval_dataset.readers) if cache_root else None
+        eval_loader = eval_dataset.loader(batch_size=batch_size, shuffle=False, num_workers=0)
+
+    checkpoint_root = checkpoint_dir(config)
+    encode_on_the_fly = cache_root is None and _frozen_encoder(config)
+    visual_encoder = VJEPA21Encoder(checkpoint_root) if encode_on_the_fly else None
+    model = build_model(config["model"], checkpoint_root, visual_encoder=visual_encoder).to(device)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
     if rank == 0:
@@ -345,55 +393,35 @@ def train(config: dict) -> None:
         print(f"stage=model status=ready trainable_parameters={parameters}", flush=True)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=float(config["training"].get("learning_rate", 5e-4)),
-        weight_decay=float(config["training"].get("weight_decay", 1e-4)),
+        lr=float(train_cfg.get("learning_rate", 5e-4)),
+        weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
-    resume = config["training"].get("resume")
-    resume_path = Path(resume) if resume else None
-    if resume_path is not None and resume_path.is_file():
-        start_epoch = load_checkpoint(resume_path, model=model, optimizer=optimizer)
-        if rank == 0:
-            print(f"stage=resume status=loaded path={resume_path} epoch={start_epoch}", flush=True)
-    else:
-        start_epoch = 0
-        if rank == 0 and resume_path is not None:
-            print(f"stage=resume status=fresh no_checkpoint={resume_path}", flush=True)
+    start_epoch = _resume(_resume_path(config), model, optimizer, rank)
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
     loader = dataset.loader(
-        batch_size=int(config["training"].get("per_gpu_batch_size", 1)),
-        num_workers=int(config["training"].get("num_workers", 0)),
+        batch_size=batch_size,
+        num_workers=int(train_cfg.get("num_workers", 0)),
         sampler=sampler,
     )
-    metadata = run_metadata(config) | {
-        "rank": rank,
-        "world_size": world_size,
-        "gpu_name": torch.cuda.get_device_name(device),
-    }
-    wandb_run = init_wandb(config, metadata=metadata, run_dir=run_root) if rank == 0 else None
+    wandb_run = None
     if rank == 0:
-        if wandb_run is None:
-            print("stage=wandb status=disabled", flush=True)
-        else:
-            print(
-                f"stage=wandb status=started url={getattr(wandb_run, 'url', None)}",
-                flush=True,
-            )
-    if rank == 0:
-        if wandb_run is not None:
-            metadata["wandb_run_id"] = getattr(wandb_run, "id", "unknown")
-            metadata["wandb_url"] = getattr(wandb_run, "url", None)
-        (run_root / "run_metadata.json").write_text(
-            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-        )
-    epochs = int(config["training"].get("epochs", 10))
-    max_steps = int(config["training"].get("max_steps", 0))
-    log_every_steps = max(1, int(config["training"].get("log_every_steps", 10)))
-    eval_every_steps = max(0, int(config["training"].get("eval_every_steps", 0)))
-    eval_max_batches = max(0, int(config["training"].get("eval_max_batches", 8)))
-    accumulation = int(config["training"].get("gradient_accumulation_steps", 1))
-    precision = torch.bfloat16 if config["training"].get("precision", "bf16") == "bf16" else torch.float16
+        metadata = run_metadata(config) | {
+            "rank": rank,
+            "world_size": world_size,
+            "gpu_name": torch.cuda.get_device_name(device),
+        }
+        wandb_run = _start_wandb(config, run_root, metadata)
+    log = _RunLog(run_root, wandb_run, enabled=rank == 0)
+
+    epochs = int(train_cfg.get("epochs", 10))
+    max_steps = int(train_cfg.get("max_steps", 0))
+    log_every_steps = max(1, int(train_cfg.get("log_every_steps", 10)))
+    eval_every_steps = max(0, int(train_cfg.get("eval_every_steps", 0)))
+    eval_max_batches = max(0, int(train_cfg.get("eval_max_batches", 8)))
+    accumulation = int(train_cfg.get("gradient_accumulation_steps", 1))
+    clip_grad_norm = float(train_cfg.get("clip_grad_norm", 1.0))
+    precision = torch.bfloat16 if train_cfg.get("precision", "bf16") == "bf16" else torch.float16
     global_step = 0
-    metrics_stream = (run_root / "metrics.jsonl").open("a", encoding="utf-8") if rank == 0 else None
     model.train()
     for epoch in range(start_epoch, epochs):
         if sampler is not None:
@@ -402,92 +430,48 @@ def train(config: dict) -> None:
         for step, batch in enumerate(loader):
             if max_steps and global_step >= max_steps:
                 break
-            if use_cache:
-                visual_tokens = cached_tokens(batch, caches, device)
-            elif _from_scratch(config):  # raw depth in meters; the model tokenizes it
-                batch["images"] = batch["images"].to(device, non_blocking=True)
-                visual_tokens = None
-            else:
-                batch["images"] = prepare_images(batch["images"], device, image_size)
-                visual_tokens = None
-            batch["proprio"] = batch["proprio"].to(device, non_blocking=True)
-            batch["actions"] = batch["actions"].to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=precision):
-                if visual_tokens is not None:
-                    batch["visual_tokens"] = visual_tokens
-                losses = model(batch)
+                inputs, visual_tokens = model_inputs(model, batch, device, caches)
+                losses = model(inputs, visual_tokens)
                 loss = losses["loss"] / accumulation
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"non-finite loss at step {global_step + 1}: {float(loss)}"
                 )
             loss.backward()
-            if (step + 1) % accumulation == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["training"].get("clip_grad_norm", 1.0)))
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                metric = {
-                    key: value.detach().float().item() for key, value in losses.items()
-                } | {"epoch": epoch, "step": global_step, "timestamp": time.time()}
-                if rank == 0 and metrics_stream is not None:
-                    metrics_stream.write(json.dumps(metric) + "\n")
-                    metrics_stream.flush()
-                if rank == 0 and (
-                    global_step == 1 or global_step % log_every_steps == 0
-                ):
-                    print(
-                        f"stage=train epoch={epoch + 1}/{epochs} step={global_step} "
-                        + " ".join(f"{key}={value:.6f}" for key, value in metric.items() if key.endswith("loss")),
-                        flush=True,
-                    )
-                    if wandb_run is not None:
-                        # Explicit global step so the W&B x-axis matches training
-                        # progress instead of W&B's internal log counter.
-                        wandb_run.log(
-                            {k: v for k, v in metric.items() if k not in ("step", "timestamp")},
-                            step=global_step,
-                        )
-                do_eval = (
-                    eval_loader is not None
-                    and eval_every_steps
-                    and (global_step == 1 or global_step % eval_every_steps == 0)
+            if (step + 1) % accumulation != 0:
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            metric = {key: value.detach().float().item() for key, value in losses.items()} | {"epoch": epoch}
+            log_now = global_step == 1 or global_step % log_every_steps == 0
+            log.record(metric, global_step, to_wandb=log_now)
+            if rank == 0 and log_now:
+                print(
+                    f"stage=train epoch={epoch + 1}/{epochs} step={global_step} "
+                    + " ".join(f"{key}={value:.6f}" for key, value in metric.items() if key.endswith("loss")),
+                    flush=True,
                 )
-                if do_eval and rank == 0:
-                    eval_metrics = _evaluate(
-                        model,
-                        eval_loader,
-                        eval_caches,
-                        device,
-                        precision,
-                        use_cache,
-                        eval_max_batches,
-                    )
-                    eval_record = {f"eval/{key}": value for key, value in eval_metrics.items()}
-                    if metrics_stream is not None:
-                        metrics_stream.write(
-                            json.dumps(eval_record | {"step": global_step, "timestamp": time.time()})
-                            + "\n"
-                        )
-                        metrics_stream.flush()
-                    if wandb_run is not None:
-                        wandb_run.log(eval_record, step=global_step)
+            if eval_loader is None or not eval_every_steps:
+                continue
+            if global_step == 1 or global_step % eval_every_steps == 0:
+                if rank == 0:
+                    eval_metrics = _evaluate(model, eval_loader, eval_caches, device, precision, eval_max_batches)
+                    log.record({f"eval/{key}": value for key, value in eval_metrics.items()}, global_step)
                     print(
                         f"stage=eval step={global_step} "
                         + " ".join(f"{key}={value:.6f}" for key, value in eval_metrics.items() if "/" not in key),
                         flush=True,
                     )
-                if do_eval:
-                    _barrier()
+                _barrier()
         if rank == 0:
             save_checkpoint(run_root / "last.pt", model=model, optimizer=optimizer, epoch=epoch + 1, config=config)
             print(f"stage=checkpoint status=saved path={run_root / 'last.pt'}", flush=True)
         if max_steps and global_step >= max_steps:
             break
-    if metrics_stream is not None:
-        metrics_stream.close()
-    if rank == 0 and wandb_run is not None:
-        wandb_run.finish()
+    log.close()
     if rank == 0:
         print(f"stage=train status=complete steps={global_step}", flush=True)
     _barrier()

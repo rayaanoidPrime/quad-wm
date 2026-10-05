@@ -15,7 +15,6 @@ control_hz: 50
 action_frames: 10
 max_gap_ms: 50
 max_drop_rate: 0.3
-calibration: per_mission
 
 normalize: true
 eval_fraction: 0.2
