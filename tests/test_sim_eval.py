@@ -297,3 +297,31 @@ def test_ev4_grid_refuses_compounds_that_would_overwrite_each_other():
     with pytest.raises(ValueError, match="distinct mass_percent"):
         _dynamics_grid(cfg)
     assert len(_dynamics_grid(cfg | {"compound": cfg["compound"][:1]})) == 2  # nominal + one compound
+
+
+def test_sharded_sim_eval_merges_back_into_the_full_result(tmp_path, monkeypatch):
+    """Array shards write separate files; the report sees one record per checkpoint, as if run in one job."""
+    from quadwm.evaluation import sim_protocol
+    from quadwm.evaluation.common import finite
+    from quadwm.evaluation.report import build_report, merge_sim_shards
+
+    monkeypatch.setattr(sim_protocol, "build_simulator", _ToySim)
+    config, sim_eval = _tiny_run(tmp_path)
+    full = sim_protocol.evaluate_in_sim(config, sim_eval)
+    for shard in (["ev1", "ev2", "ev6"], ["ev3"], ["ev4"]):
+        sim_protocol.evaluate_in_sim(config, sim_eval, only=shard)
+
+    folder = tmp_path / "runs" / "sim-run" / "eval"
+    names = sorted(path.name for path in folder.glob("*.json"))
+    assert names == ["last-sim-smoke-ev1-ev2-ev6.json", "last-sim-smoke-ev3.json", "last-sim-smoke-ev4.json",
+                     "last-sim-smoke.json"]
+    shards = [json.loads((folder / name).read_text("utf-8")) for name in names if name != "last-sim-smoke.json"]
+    merged, = merge_sim_shards(shards)
+    assert merged["evals"] == list(sim_protocol.EVALS)
+    expected = finite(full)  # as written to disk: NaN -> null
+    for name in ("probes", "ev2", "ev3", "ev4", "ev6"):
+        assert json.dumps(merged[name], sort_keys=True) == json.dumps(expected[name], sort_keys=True)
+    assert "EV4 retention" in build_report(shards)
+
+    with pytest.raises(ValueError, match="more than one"):  # the full file plus a shard double-counts ev3
+        merge_sim_shards([json.loads((folder / "last-sim-smoke.json").read_text("utf-8")), shards[1]])

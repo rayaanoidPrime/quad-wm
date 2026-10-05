@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -39,11 +40,11 @@ def fallen(observation: dict, *, max_gravity_z: float = -0.5, min_clearance_m: f
 
 
 def frame_images(frames, modality: str, depth_size: int, depth_range) -> torch.Tensor:
-    """[T, H, W] depth (m) or [T, H, W, 3] RGB -> model images, as the GrandTour dataset emits them."""
+    """[T, H, W] depth (m) or [T, H, W, 3] uint8 RGB -> model images, as the GrandTour dataset emits them."""
     if modality == "depth":
         return torch.stack([pool_depth(np.asarray(frame, dtype=np.float32), depth_size, tuple(depth_range))
                             for frame in frames])
-    return torch.from_numpy(np.asarray(frames)).permute(0, 3, 1, 2).float()
+    return torch.from_numpy(np.asarray(frames, dtype=np.uint8)).permute(0, 3, 1, 2)
 
 
 def collect_episode(sim, controller, *, seed: int, terrain: TerrainSpec, ticks: int, command_mps: float,
@@ -118,7 +119,8 @@ def episode_set(sim_factory, controller_factory, sim_config: dict, controller_co
         episode = collect_episode(sim, controller, seed=seed, terrain=terrain, ticks=int(spec["ticks"]),
                                   command_mps=command, heading_change_rad=float(spec["heading_change_rad"]),
                                   action_noise_rad=float(spec["action_noise_rad"]))
-        temporary = path.with_name(path.stem + ".part.npz")
+        # Per-process name: concurrent sim-eval shards may render the same missing episode.
+        temporary = path.with_name(f"{path.stem}.{os.getpid()}.part.npz")
         np.savez_compressed(temporary, **episode)
         temporary.replace(path)
         print(f"stage=sim_episodes split={split} episode={name} fell={bool(episode['fallen'].any())}", flush=True)

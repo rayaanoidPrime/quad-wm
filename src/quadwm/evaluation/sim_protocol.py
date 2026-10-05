@@ -313,6 +313,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
                  "episodes": {split: [path.name for path in split_paths] for split, split_paths in paths.items()},
                  "context_frames": context_frames},
         "horizons": horizons,
+        "evals": sorted(only),
         "probes": probe_eval.results if "ev1" in only else {},
         "not_run": {
             "EV3_learned_policy": "actor-critic trained in imagination is not implemented; only the CEM "
@@ -332,7 +333,9 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
             if name in only:
                 print(f"stage=sim_eval ev={name[2:]} status=starting", flush=True)
                 result[name] = evaluate(arms, sim_eval_config[name])
-    output = write_result(result, output, run_root, checkpoint, sim_eval_config["name"])
+    # A subset (one shard of a Slurm array) gets its own file; `quadwm report` merges the shards.
+    name = sim_eval_config["name"] if only == set(EVALS) else f"{sim_eval_config['name']}-{'-'.join(sorted(only))}"
+    output = write_result(result, output, run_root, checkpoint, name)
     print(f"stage=sim_eval status=complete output={output}", flush=True)
     return result
 

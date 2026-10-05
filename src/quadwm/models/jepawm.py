@@ -110,14 +110,34 @@ class RotaryAttention(nn.Module):
         rotated = rotated.flatten(-2)
         return torch.cat((rotated, values[..., self.rotary_dim :]), dim=-1)
 
-    def forward(self, values: Tensor, mask: Tensor) -> Tensor:
+    def forward(self, values: Tensor, mask: Tensor | None = None, *,
+                frame_window: tuple[int, int] | None = None) -> Tensor:
+        """Attention over [B, L, D] with an additive ``mask`` [L, L], or ``frame_window``.
+
+        ``frame_window = (tokens_per_frame, window)``: each frame attends to
+        itself and the ``window - 1`` frames before it -- what a dense
+        frame-causal mask allows, but computed one query frame at a time over
+        only its allowed keys. That skips the masked-out blocks entirely and
+        lets SDPA use its fastest (mask-free) kernel.
+        """
         batch, length, dim = values.shape
         qkv = self.qkv(values).reshape(batch, length, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = self._rotate(q.transpose(1, 2))
         k = self._rotate(k.transpose(1, 2))
         v = v.transpose(1, 2)
-        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        if frame_window is None:
+            output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            tokens, window = frame_window
+            output = torch.cat([
+                F.scaled_dot_product_attention(
+                    q[:, :, start : start + tokens],
+                    k[:, :, max(0, start - (window - 1) * tokens) : start + tokens],
+                    v[:, :, max(0, start - (window - 1) * tokens) : start + tokens],
+                )
+                for start in range(0, length, tokens)
+            ], dim=2)
         return self.proj(output.transpose(1, 2).reshape(batch, length, dim))
 
 # TODO understand this
@@ -136,12 +156,24 @@ class AdaLNBlock(nn.Module):
         nn.init.zeros_(self.modulation[-1].weight)
         nn.init.zeros_(self.modulation[-1].bias)
 
-    def forward(self, values: Tensor, condition: Tensor, mask: Tensor) -> Tensor:
-        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.modulation(condition).chunk(6, dim=-1)
-        attention_input = self.norm_attention(values) * (1 + scale_a) + shift_a
-        values = values + gate_a * self.attention(attention_input, mask)
+    def forward(self, values: Tensor, condition: Tensor, mask: Tensor | None = None, *,
+                frame_window: tuple[int, int] | None = None) -> Tensor:
+        """values [B, F x N, D] (N tokens per frame); condition [B, F, D], one row per frame.
+
+        The modulation is computed once per frame and broadcast over that
+        frame's tokens, not once per (identical) token. ``mask`` and
+        ``frame_window`` go to ``RotaryAttention``.
+        """
+        batch, length, dim = values.shape
+        frames = condition.shape[1]
+        modulation = self.modulation(condition).unsqueeze(2)  # [B, F, 1, 6D]
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = modulation.chunk(6, dim=-1)
+        values = values.view(batch, frames, length // frames, dim)
+        attention_input = (self.norm_attention(values) * (1 + scale_a) + shift_a).flatten(1, 2)
+        attended = self.attention(attention_input, mask, frame_window=frame_window)
+        values = values + gate_a * attended.view_as(values)
         mlp_input = self.norm_mlp(values) * (1 + scale_m) + shift_m
-        return values + gate_m * self.mlp(mlp_input)
+        return (values + gate_m * self.mlp(mlp_input)).flatten(1, 2)
 
 
 class Predictor(nn.Module):
@@ -167,25 +199,15 @@ class Predictor(nn.Module):
         self.visual_head = nn.Linear(dim, visual_dim)
         self.proprio_head = nn.Linear(dim, proprio_dim)
 
-    def _mask(self, frames: int, device: torch.device) -> Tensor:
-        length = frames * self.tokens_per_frame
-        frame = torch.arange(length, device=device) // self.tokens_per_frame
-        allowed = (frame[:, None] >= frame[None, :]) & (
-            frame[:, None] - frame[None, :] < self.local_window_time
-        )
-        mask = torch.full((length, length), float("-inf"), device=device)
-        return mask.masked_fill(allowed, 0.0)[None, None]
-
     def forward(self, context: Tensor, actions: Tensor) -> Tensor:
         batch, frames, tokens, dim = context.shape
         if tokens != self.tokens_per_frame:
             raise ValueError(f"expected {self.tokens_per_frame} visual tokens, got {tokens}")
-        condition = actions.unsqueeze(2).expand(batch, frames, tokens, dim)
         values = context.reshape(batch, frames * tokens, dim)
-        condition = condition.reshape(batch, frames * tokens, dim)
-        mask = self._mask(frames, values.device)
+        # Frame-causal, local in time: a frame sees itself and the previous local_window_time - 1 frames.
+        frame_window = (tokens, self.local_window_time)
         for block in self.blocks:
-            values = block(values, condition, mask)
+            values = block(values, actions, frame_window=frame_window)  # actions [B, F, D]: one row per frame
         hidden = self.norm(values)
         visual = self.visual_head(hidden)
         proprio = self.proprio_head(hidden)

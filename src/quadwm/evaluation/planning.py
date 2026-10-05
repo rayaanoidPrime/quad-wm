@@ -81,7 +81,14 @@ class Planner:
                       for key, value in self.normalization.items()}
         self.context_steps = self.model.context_steps
         self.horizon = int(self.config["horizon_ticks"])
-        self.generator = torch.Generator().manual_seed(int(self.config["seed"]))
+        self.generator = torch.Generator()
+        self.reseed(0)
+
+    def reseed(self, episode_seed: int) -> None:
+        """CEM noise from (planning seed, episode seed) only, so an episode's result does not depend on
+        which episodes or evals ran before it in the job (sharded sim evals match a single job)."""
+        state = np.random.SeedSequence([int(self.config["seed"]), int(episode_seed)]).generate_state(1)[0]
+        self.generator.manual_seed(int(state))
 
     @torch.no_grad()
     def encode(self, observations: list[dict]) -> Tensor:
@@ -163,6 +170,8 @@ def run_episode(sim, controller, spec: EpisodeSpec, *, terrain: TerrainSpec, see
     observation = sim.reset(seed=seed, terrain=terrain, dynamics=dynamics)
     controller.command_mps = spec.command_mps
     controller.reset(heading=0.0)
+    if planner is not None:
+        planner.reseed(seed)
     context = planner.context_steps if planner is not None else 1
     history: deque = deque(maxlen=context)
     actions: deque = deque(maxlen=max(context - 1, 1))

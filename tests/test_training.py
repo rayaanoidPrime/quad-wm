@@ -159,3 +159,14 @@ def test_resume_last_follows_the_run_name(tmp_path):
     assert _resume_path(config) == Path("elsewhere/last.pt")
     config["training"]["resume"] = ""
     assert _resume_path(config) is None
+
+
+def test_prepare_images_from_uint8_matches_the_float_path():
+    """Datasets now hand over uint8 RGB; the GPU-side conversion must give the same V-JEPA input."""
+    from quadwm.tokens import prepare_images
+
+    images = torch.randint(0, 256, (2, 3, 3, 24, 32), dtype=torch.uint8)
+    cpu = torch.device("cpu")
+    assert torch.allclose(prepare_images(images, cpu, 16), prepare_images(images.float(), cpu, 16))
+    if torch.cuda.is_available():  # pinning needs an accelerator
+        assert torch.allclose(prepare_images(images.pin_memory(), cpu, 16), prepare_images(images, cpu, 16))

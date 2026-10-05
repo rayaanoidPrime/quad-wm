@@ -747,7 +747,8 @@ class GrandTourSequenceDataset(Dataset):
             )
         elif self.load_images:
             observations = np.stack([reader.load_image(i) for i in image_ids])
-            output["images"] = torch.from_numpy(observations).permute(0, 3, 1, 2).float()
+            # uint8 until the GPU; prepare_images converts (4x smaller batches than float32).
+            output["images"] = torch.from_numpy(observations).permute(0, 3, 1, 2)
         return output
 
     def loader(

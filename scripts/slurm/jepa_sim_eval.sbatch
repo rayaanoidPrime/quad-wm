@@ -17,9 +17,25 @@ STORAGE_ROOT="${QUADWM_STORAGE_ROOT:-$PROJECT_PARENT/quad-wm-storage}"
 # last.pt, splits.json and normalization. Example:
 #   CONFIG=configs/jepa-wm/lewm_depth.yaml RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth sbatch scripts/slurm/jepa_sim_eval.sbatch
 # Optional: ONLY=ev1,ev2 to run a subset (probes are always fit).
+#
+# Sharded across GPUs as a job array: one GPU per shard, each writing its own
+# <ckpt>-<sim name>-<evals>.json, which `quadwm report` merges. EV3 and EV4 are
+# the planning-heavy evals, so the default split gives each its own GPU:
+#   CONFIG=... RUN_ROOT=... sbatch --array=0-2 scripts/slurm/jepa_sim_eval.sbatch
+# Override the split with space-separated ONLY_SETS (one entry per array index).
+# Optional, once per sim config: render the shared EV1 episodes first so the
+# shards do not all render them: uv run --extra sim quadwm sim-collect
 RUN_ROOT="${RUN_ROOT:-${QUADWM_RUN_ROOT:-$STORAGE_ROOT/runs/jepa-baseline}}"
 CONFIG="${CONFIG:-configs/jepa-wm/baseline.yaml}"
 SIM_EVAL_CONFIG="${SIM_EVAL_CONFIG:-configs/eval/sim.yaml}"
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" && -z "${ONLY:-}" ]]; then
+  read -r -a SHARDS <<< "${ONLY_SETS:-ev1,ev2,ev6 ev3 ev4}"
+  if (( SLURM_ARRAY_TASK_ID >= ${#SHARDS[@]} )); then
+    echo "array index $SLURM_ARRAY_TASK_ID has no shard in ONLY_SETS=(${SHARDS[*]})" >&2
+    exit 1
+  fi
+  ONLY="${SHARDS[$SLURM_ARRAY_TASK_ID]}"
+fi
 
 module purge
 module load python/3.11

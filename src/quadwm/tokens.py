@@ -17,14 +17,20 @@ from torch import Tensor
 
 
 def prepare_images(images: torch.Tensor, device: torch.device, size: int) -> torch.Tensor:
+    """uint8 RGB [B, T, 3, H, W] (0-255) -> V-JEPA input [B, T, 3, size, size] on ``device``.
+
+    Datasets keep RGB as uint8 so the host-to-device copy moves 4x fewer bytes
+    than float32; the float conversion happens on the GPU.
+    """
     batch, frames, channels, height, width = images.shape
     # This ROCm stack hands back an all-NaN tensor for the H2D copy of a large
     # pinned float32 tensor (HIP pinned-allocator bug), synchronously or not.
-    # An unpinned clone is safe, so drop the pin before copying. Eval loaders
-    # pin their batches; see collect_latents.
+    # RGB batches are uint8 now, which should not hit it, but that is not yet
+    # verified on the cluster, so still drop the pin (a cheap uint8 clone) before
+    # copying. The training loader pins its batches; eval loaders do not.
     if images.is_pinned():
         images = images.clone()
-    images = images.to(device).div(255.0)
+    images = images.to(device).float().div(255.0)
     images = images.reshape(batch * frames, channels, height, width)
     images = torch.nn.functional.interpolate(
         images, size=(size, size), mode="bilinear", align_corners=False

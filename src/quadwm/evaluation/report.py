@@ -5,6 +5,8 @@ any mix. Runs are grouped by model group (the W&B group, shared by a
 recipe's seeds). Every cell is mean ± std with its seed count; pairwise group
 comparisons use Mann-Whitney U with Holm correction (protocol §11) and need
 n >= 3 per group. Δ_s2r(k) pairs the real and sim JSON of each checkpoint.
+Sim evals run as a Slurm array write one file per shard; they are merged
+back into one record per checkpoint first (``merge_sim_shards``).
 """
 
 from __future__ import annotations
@@ -64,6 +66,41 @@ def comparability_problems(runs: list[dict]) -> list[str]:
             if len(seen) > 1:
                 problems.append(f"{domain}: {'.'.join(path)} differs across runs: {sorted(seen)}")
     return problems
+
+
+SIM_SHARD_KEYS = ("ev2", "ev3", "ev4", "ev6")
+
+
+def merge_sim_shards(runs: list[dict]) -> list[dict]:
+    """One sim record per (checkpoint, sim eval config), from shards run with ``--only`` subsets.
+
+    Shards of a checkpoint must have identical windows and episodes, and each
+    eval may come from only one shard; anything else is an error, not a guess.
+    """
+    merged: dict[tuple, dict] = {}
+    result = []
+    for run in runs:
+        if _domain(run) != "sim":
+            result.append(run)
+            continue
+        key = (run["model"]["checkpoint"], run["eval_config"])
+        if key not in merged:
+            merged[key] = dict(run)
+            result.append(merged[key])
+            continue
+        base = merged[key]
+        if run["data"] != base["data"] or run["horizons"] != base["horizons"]:
+            raise ValueError(f"sim shards of {key[0]} ({key[1]}) used different episodes, windows or horizons")
+        duplicates = [name for name in SIM_SHARD_KEYS if name in run and name in base]
+        if run.get("probes") and base.get("probes"):
+            duplicates.append("ev1")
+        if duplicates:
+            raise ValueError(f"{key[0]} ({key[1]}): {duplicates} appear in more than one sim eval file")
+        base.update({name: run[name] for name in SIM_SHARD_KEYS if name in run})
+        if run.get("probes"):
+            base["probes"] = run["probes"]
+        base["evals"] = sorted(set(base.get("evals", [])) | set(run.get("evals", [])))
+    return result
 
 
 def _grouped(runs: list[dict]) -> dict[str, list[dict]]:
@@ -191,6 +228,7 @@ def _compute_section(groups: dict[str, list[dict]]) -> list[str]:
 
 
 def build_report(runs: list[dict]) -> str:
+    runs = merge_sim_shards(runs)
     real = [run for run in runs if _domain(run) == "real"]
     sim = [run for run in runs if _domain(run) == "sim"]
     lines = ["# Shared-protocol report", ""]

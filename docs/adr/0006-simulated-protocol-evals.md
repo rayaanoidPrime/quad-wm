@@ -91,3 +91,22 @@ recipes assume:
   candidate is a 576-token × 3-frame predictor rollout, which can take on
   the order of a day. Use `--only` to split the work across jobs; budgets
   must not differ between models.
+
+## Addendum (2026-10-06): sharded runs and per-episode CEM seeds
+
+- `jepa_sim_eval.sbatch` runs as a Slurm array (`--array=0-2`), one GPU per
+  `--only` subset (default `ev1,ev2,ev6`, `ev3`, `ev4`). Each shard writes
+  `<ckpt>-<sim name>-<evals>.json`; `quadwm report` merges the shards of a
+  checkpoint and refuses mismatched episodes or an eval present twice.
+- The planner used one CEM random stream for the whole job, so an episode's
+  result depended on which episodes ran before it: EV4 numbers differed
+  between a full run and `--only ev4`. CEM is now reseeded at the start of
+  every episode from (`planning.seed`, episode seed). Episodes are
+  reproducible on their own, shards match a single job, and every condition
+  of a given seed uses the same CEM noise (common random numbers, which
+  lowers the variance of EV4 retention and EV6 ratios). Planning-arm numbers
+  from before this change are not bit-comparable with later ones; the
+  controller-only arm is unaffected.
+- The baseline predictor computes AdaLN modulation once per frame and
+  attends block by block over the frames its window allows. Outputs are
+  unchanged (tests compare against the dense-mask reference); it is faster.
