@@ -48,12 +48,17 @@ def frame_images(frames, modality: str, depth_size: int, depth_range) -> torch.T
 
 
 def collect_episode(sim, controller, *, seed: int, terrain: TerrainSpec, ticks: int, command_mps: float,
-                    heading_change_rad: float, action_noise_rad: float,
+                    heading_change_rad: float, action_noise_rad: float, residual_noise_rad: float = 0.0,
                     dynamics: DynamicsSpec = DynamicsSpec()) -> dict[str, np.ndarray]:
     """Drive the controller (plus Gaussian action noise) for ``ticks`` world-model ticks.
 
     Halfway through, the commanded heading turns by ``heading_change_rad``
     (random sign) so episodes include turning, not only straight walking.
+    ``action_noise_rad`` is i.i.d. per control frame; ``residual_noise_rad``
+    adds a per-joint offset held for the whole tick, the shape of the EV3
+    planner's residuals, so fine-tuning data shows what such actions do
+    (docs/adr/0007). At 0 no extra random draws happen, so episodes without it
+    are unchanged.
     """
     rng = np.random.default_rng(seed)
     observation = sim.reset(seed=seed, terrain=terrain, dynamics=dynamics)
@@ -68,6 +73,9 @@ def collect_episode(sim, controller, *, seed: int, terrain: TerrainSpec, ticks: 
             controller.heading += heading_change_rad * rng.choice([-1.0, 1.0])
         action = controller.act(observation)
         action = action + rng.normal(0.0, action_noise_rad, action.shape)
+        if residual_noise_rad > 0:
+            joints = len(controller.default_pose)
+            action = action + np.tile(rng.normal(0.0, residual_noise_rad, joints), len(action) // joints)
         actions.append(action)
         observation = sim.step(action)
     episode = {key: np.stack([frame[key] for frame in frames]).astype(np.float32) for key in (*STATE_KEYS, "proprio")}
@@ -104,13 +112,19 @@ def episode_cache_key(sim_config: dict, controller_config: dict, spec: dict, spl
 
 
 def episode_set(sim_factory, controller_factory, sim_config: dict, controller_config: dict, spec: dict,
-                split: str) -> list[Path]:
-    """Paths of the split's cached episodes, collecting (and rendering) them on first use."""
+                split: str, *, collect: bool = True) -> list[Path]:
+    """Paths of the split's cached episodes, collecting (and rendering) them on first use.
+
+    With ``collect=False`` a missing or partial cache is an error instead (training never renders).
+    """
     folder = Path(spec["cache_root"]).expanduser() / f"{split}-{episode_cache_key(sim_config, controller_config, spec, split)}"
     specs = _episode_specs(spec, split)
     paths = [folder / f"{name}.npz" for name, *_ in specs]
     if (folder / "complete.json").is_file():
         return paths
+    if not collect:
+        raise FileNotFoundError(f"sim episodes for split {split!r} are not cached in {folder}; "
+                                "render them first with `quadwm sim-collect`")
     folder.mkdir(parents=True, exist_ok=True)
     sim, controller = sim_factory(), controller_factory()
     for path, (name, terrain, seed, command) in zip(paths, specs):
@@ -118,7 +132,8 @@ def episode_set(sim_factory, controller_factory, sim_config: dict, controller_co
             continue
         episode = collect_episode(sim, controller, seed=seed, terrain=terrain, ticks=int(spec["ticks"]),
                                   command_mps=command, heading_change_rad=float(spec["heading_change_rad"]),
-                                  action_noise_rad=float(spec["action_noise_rad"]))
+                                  action_noise_rad=float(spec["action_noise_rad"]),
+                                  residual_noise_rad=float(spec.get("residual_noise_rad", 0.0)))
         # Per-process name: concurrent sim-eval shards may render the same missing episode.
         temporary = path.with_name(f"{path.stem}.{os.getpid()}.part.npz")
         np.savez_compressed(temporary, **episode)

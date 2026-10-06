@@ -12,10 +12,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from .config import checkpoint_dir, data_dir, run_dir
+from .config import checkpoint_dir, data_dir, load_config, referenced_path, run_dir
 from .data import (
     build_sequence_dataset,
     fetch_missions,
@@ -223,10 +223,23 @@ def _sequence_dataset(
     )
 
 
+def _finetune_parent(config: dict) -> dict | None:
+    """``finetune.init_from``: the checkpoint a fine-tune starts from (docs/adr/0007), or None."""
+    path = config.get("finetune", {}).get("init_from")
+    if not path:
+        return None
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"finetune.init_from checkpoint {path} not found; train the parent run first")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 def _build_datasets(
-    config: dict, run_root: Path, rank: int
+    config: dict, run_root: Path, rank: int, parent: dict | None = None
 ) -> tuple[GrandTourSequenceDataset, GrandTourSequenceDataset | None]:
-    """Checked train and held-out datasets, normalized with training-split statistics."""
+    """Checked train and held-out datasets, normalized with training-split statistics.
+
+    A fine-tune keeps its ``parent`` checkpoint's statistics, so its inputs mean what they meant.
+    """
     data_cfg = config["data"]
     train_missions, eval_missions = _resolve_splits(config, run_root, rank)
     dataset = _sequence_dataset(config, train_missions, data_cfg.get("max_sequences"))
@@ -234,7 +247,12 @@ def _build_datasets(
     if data_cfg.get("normalize", True):
         # Training-split statistics only; eval data reuses them. Stored in the
         # config so every checkpoint carries the transform it was trained with.
-        data_cfg["normalization"] = normalization_stats(dataset.readers, int(data_cfg["action_frames"]))
+        if parent is not None:
+            data_cfg["normalization"] = parent["config"]["data"]["normalization"]
+        else:
+            data_cfg["normalization"] = normalization_stats(
+                dataset.readers, int(data_cfg["action_frames"]), float(data_cfg["control_hz"])
+            )
         dataset.normalization = data_cfg["normalization"]
         if rank == 0:
             _write_json(run_root / "normalization.json", data_cfg["normalization"])
@@ -256,6 +274,34 @@ def _build_datasets(
             flush=True,
         )
     return dataset, eval_dataset
+
+
+def _sim_dataset(config: dict) -> Dataset | None:
+    """``finetune.sim_episodes``: windows of cached simulated episodes, laid out like GrandTour windows.
+
+    The episodes are rendered beforehand (``quadwm sim-collect``); training never renders, so ranks
+    do not wait on rank 0 at a barrier. ``finetune.sim_repeat`` repeats the set to set the sim share.
+    """
+    finetune = config.get("finetune", {})
+    if not finetune.get("sim_episodes"):
+        return None
+    from .sim.episodes import SimWindowDataset, camera_modality, episode_set, load_episode
+
+    data_cfg, model_cfg = config["data"], config["model"]
+    episodes_cfg = load_config(referenced_path(config, finetune["sim_episodes"]))
+    sim_cfg = load_config(referenced_path(episodes_cfg, episodes_cfg["sim_config"]))["sim"]
+    spec = episodes_cfg["episodes"]
+    paths = [path for split in spec["splits"]
+             for path in episode_set(None, None, sim_cfg, episodes_cfg["controller"], spec, split, collect=False)]
+    windows = SimWindowDataset(
+        [load_episode(path) for path in paths], context_frames=int(model_cfg["context_steps"]),
+        steps=int(model_cfg["rollout_steps"]), stride_ticks=int(spec["window_stride_ticks"]),
+        modality=camera_modality(data_cfg["observation"]), normalization=data_cfg.get("normalization"),
+        depth_size=int(data_cfg.get("depth_size", 64)), depth_range=data_cfg.get("depth_range", (0.2, 10.0)),
+    )
+    if not len(windows):
+        raise ValueError(f"no fall-free windows in the {len(paths)} sim fine-tuning episodes")
+    return ConcatDataset([windows] * int(finetune.get("sim_repeat", 1)))
 
 
 def _token_cache(
@@ -373,7 +419,8 @@ def train(config: dict) -> None:
         prepare(config)
     _barrier()
 
-    dataset, eval_dataset = _build_datasets(config, run_root, rank)
+    parent = _finetune_parent(config)
+    dataset, eval_dataset = _build_datasets(config, run_root, rank, parent)
     cache_root = _token_cache(config, [dataset] + ([eval_dataset] if eval_dataset else []), device, rank, world_size)
     caches = load_token_caches(cache_root, dataset.readers) if cache_root else None
     batch_size = int(train_cfg.get("per_gpu_batch_size", 1))
@@ -385,7 +432,17 @@ def train(config: dict) -> None:
     checkpoint_root = checkpoint_dir(config)
     encode_on_the_fly = cache_root is None and _frozen_encoder(config)
     visual_encoder = VJEPA21Encoder(checkpoint_root) if encode_on_the_fly else None
-    model = build_model(config["model"], checkpoint_root, visual_encoder=visual_encoder).to(device)
+    model = build_model(config["model"], checkpoint_root, visual_encoder=visual_encoder)
+    if hasattr(model, "set_input_normalization") and config["data"].get("normalization"):
+        model.set_input_normalization(config["data"]["normalization"])
+    if parent is not None:
+        # Weights only: the fine-tune has its own optimizer, epochs, and last.pt to resume.
+        model.load_state_dict(parent["model"])
+        if rank == 0:
+            print(f"stage=finetune status=initialized from={config['finetune']['init_from']} "
+                  f"parent_epoch={parent.get('epoch')}", flush=True)
+        del parent
+    model = model.to(device)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
     if rank == 0:
@@ -397,11 +454,23 @@ def train(config: dict) -> None:
         weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
     start_epoch = _resume(_resume_path(config), model, optimizer, rank)
-    sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
-    loader = dataset.loader(
+    train_set: Dataset = dataset
+    sim_windows = _sim_dataset(config)
+    if sim_windows is not None:
+        if cache_root is not None:
+            raise ValueError("sim fine-tuning needs a model that encodes images; the token cache has no sim frames")
+        train_set = ConcatDataset([dataset, sim_windows])
+        if rank == 0:
+            print(f"stage=finetune sim_windows={len(sim_windows)} grandtour_windows={len(dataset)}", flush=True)
+    sampler = DistributedSampler(train_set, shuffle=True) if world_size > 1 else None
+    loader = DataLoader(
+        train_set,
         batch_size=batch_size,
-        num_workers=int(train_cfg.get("num_workers", 0)),
+        shuffle=sampler is None,
         sampler=sampler,
+        num_workers=int(train_cfg.get("num_workers", 0)),
+        pin_memory=True,
+        drop_last=True,
     )
     wandb_run = None
     if rank == 0:

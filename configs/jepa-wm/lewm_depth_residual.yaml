@@ -1,0 +1,65 @@
+# lewm_depth_grounded.yaml plus joint-residual action input (docs/adr/0007):
+# the predictor sees each tick's commands minus the joint positions the state
+# head decodes from that tick's latent, standardized by the residual statistics
+# (EV2 showed both models under-react to actions, ASR 0.3-0.7).
+# One run per seed: QUADWM_SEED picks the seed and the run dir; the mission
+# split stays fixed by data.split_seed.
+name: lewm-depth-residual-s${QUADWM_SEED:-4551}
+seed: ${QUADWM_SEED:-4551}
+
+run_root: ${QUADWM_RUN_ROOT:-~/quad-wm-storage/runs}
+checkpoint_root: ${QUADWM_CHECKPOINT_ROOT:-~/quad-wm-storage/checkpoints}
+data_config: configs/data/depth.yaml
+
+model:
+  type: lewm
+  image_size: 64          # must equal data.depth_size; 64 patches of 8x8
+  patch_size: 8
+  encoder_dim: 192        # ViT-Tiny-sized encoder (LeWM scale)
+  encoder_depth: 12
+  encoder_heads: 3
+  latent_dim: 192
+  predictor_dim: 384
+  predictor_depth: 6
+  predictor_heads: 6
+  predictor_window: 4     # frames of history the predictor attends to
+  proprio_dim: 33
+  action_dim: 120
+  context_steps: 4        # sample = context + rollout = 8 ticks = 1.6 s at 5 Hz
+  rollout_steps: 4        # PiJEPA-style curriculum: raise via resume (1 -> 2 -> 4)
+  sigreg_slices: 1024
+  transition_horizons: [1, 4]
+  action_input: joint_residual  # needs loss_weights.state > 0 (the state head decodes joints)
+  loss_weights:
+    pred: 1.0
+    rollout: 1.0
+    sigreg: 0.1           # LeWM's single knob; sweep {0.01, 0.1, 1.0}
+    state: 1.0            # E1.3 grounding arms: base = 0/0, full PSG = 1/1
+    transition: 1.0
+
+training:
+  epochs: 50
+  per_gpu_batch_size: 128   # SIGReg is a batch statistic; keep batches large
+  gradient_accumulation_steps: 1
+  num_workers: 8
+  precision: bf16
+  learning_rate: 0.0003
+  weight_decay: 0.05
+  clip_grad_norm: 1.0
+  # Refuse to start if another process already holds more than half a GPU.
+  min_free_gpu_fraction: 0.5
+  log_every_steps: 50
+  eval_every_steps: 500
+  eval_max_batches: 8
+  resume: last              # <run_root>/<name>/last.pt, so it follows `name`
+
+wandb:
+  enabled: ${QUADWM_WANDB_ENABLED:-true}
+  project: jepa-wm
+  name: lewm-depth-residual-s${QUADWM_SEED:-4551}-${SLURM_JOB_ID:-local}
+  group: lewm-depth-residual
+  job_type: train
+  tags:
+    - slurm-${SLURM_JOB_ID:-local}
+    - git-${QUADWM_GIT_COMMIT:-unknown}
+  mode: ${WANDB_MODE:-online}

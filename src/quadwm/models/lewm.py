@@ -16,6 +16,10 @@ from torch.nn import functional as F
 from ..data.grandtour import PROPRIO_LAYOUT
 from .jepawm import AdaLNBlock
 
+# How the predictor sees actions: normalized absolute joint commands, or commands
+# relative to the current joint positions (docs/adr/0007).
+ACTION_INPUTS = ("absolute", "joint_residual")
+
 
 def sigreg(z: Tensor, slices: int = 1024, knots: int = 17, t_max: float = 3.0) -> Tensor:
     """SIGReg (LeJEPA): Epps-Pulley distance of random 1-D projections of z from N(0, 1).
@@ -112,8 +116,12 @@ class LeWorldModel(nn.Module):
         loss_weights: dict[str, float] | None = None,
         sigreg_slices: int = 1024,
         transition_horizons: tuple[int, ...] = (1, 4),
+        action_input: str = "absolute",
     ):
         super().__init__()
+        if action_input not in ACTION_INPUTS:
+            raise ValueError(f"action_input={action_input!r}; expected one of {ACTION_INPUTS}")
+        self.action_input = action_input
         self.context_steps, self.rollout_steps = context_steps, rollout_steps
         self.image_size, self.latent_dim = image_size, latent_dim
         self.action_dim, self.proprio_dim = action_dim, proprio_dim
@@ -135,6 +143,53 @@ class LeWorldModel(nn.Module):
         self.transition_head = (
             mlp(2 * latent_dim, 256, joints.stop - joints.start) if self.weights["transition"] else None
         )
+        if action_input == "joint_residual":
+            # Joint positions come from the state head, so the residual exists for
+            # predicted frames too (open loop never reads future measured state).
+            if self.state_head is None:
+                raise ValueError("action_input=joint_residual decodes joint positions with the state head; "
+                                 "set loss_weights.state > 0")
+            joint_count = joints.stop - joints.start
+            if action_dim % joint_count:
+                raise ValueError(f"action_dim={action_dim} is not a whole number of {joint_count}-joint frames")
+            # Input normalization (docs/adr/0002, 0007), set by training from the
+            # data statistics and restored with the state dict.
+            for name, size in (("action_mean", action_dim), ("action_std", action_dim),
+                               ("joint_mean", joint_count), ("joint_std", joint_count),
+                               ("residual_mean", action_dim), ("residual_std", action_dim)):
+                self.register_buffer(name, torch.zeros(size) if name.endswith("mean") else torch.ones(size))
+
+    def set_input_normalization(self, normalization: dict) -> None:
+        """Load the run's data statistics; joint_residual models need them to un-normalize inputs."""
+        if self.action_input != "joint_residual":
+            return
+        missing = {"residual_mean", "residual_std"} - set(normalization)
+        if missing:
+            raise ValueError(f"normalization lacks {sorted(missing)}; recompute it with control_hz")
+        values = {
+            "action_mean": normalization["action_mean"], "action_std": normalization["action_std"],
+            "joint_mean": normalization["proprio_mean"][self.joint_slice],
+            "joint_std": normalization["proprio_std"][self.joint_slice],
+            "residual_mean": normalization["residual_mean"], "residual_std": normalization["residual_std"],
+        }
+        for name, value in values.items():
+            getattr(self, name).copy_(torch.as_tensor(value, dtype=torch.float32))
+
+    def predictor_actions(self, latents: Tensor, actions: Tensor) -> Tensor:
+        """What the predictor is conditioned on: ``actions`` [B, T, A] (normalized commands) as given, or,
+        for ``joint_residual``, each tick's commands minus the joint positions decoded from ``latents``
+        [B, T, D] at that tick, standardized by the residual statistics."""
+        if self.action_input == "absolute":
+            return actions
+        with torch.autocast(device_type=latents.device.type, enabled=False):
+            # No gradient through the decoded joints: the state head (and the encoder
+            # through it) is trained by state_loss alone, so it keeps meaning "joint positions".
+            joints = self.state_head(latents.float())[..., self.joint_slice].detach()
+            joints = joints * self.joint_std + self.joint_mean
+            commands = actions.float() * self.action_std + self.action_mean
+            frames = commands.unflatten(-1, (-1, joints.shape[-1])) - joints.unsqueeze(-2)
+            residual = (frames.flatten(-2) - self.residual_mean) / self.residual_std
+        return residual.to(actions.dtype)
 
     def encode(self, depth: Tensor, proprio: Tensor) -> Tensor:
         """depth [B, T, 2, S, S], proprio [B, T, P] -> latents [B, T, D]."""
@@ -154,8 +209,14 @@ class LeWorldModel(nn.Module):
         return frames
 
     def training_only_modules(self) -> list[nn.Module]:
-        """PSG grounding heads: they exist only for training losses (EV7 reports them separately)."""
-        return [head for head in (self.state_head, self.transition_head) if head is not None]
+        """PSG grounding heads: they exist only for training losses (EV7 reports them separately).
+
+        A joint_residual model's state head also builds its rollout inputs, so it counts as inference.
+        """
+        heads = [self.transition_head]
+        if self.action_input != "joint_residual":
+            heads.append(self.state_head)
+        return [head for head in heads if head is not None]
 
     def rollout(self, context: Tensor, actions: Tensor, steps: int) -> Tensor:
         """Open-loop: [B, W, D] context + actions aligned to frames (actions[:, i] moves
@@ -163,7 +224,9 @@ class LeWorldModel(nn.Module):
         frames = context
         for _ in range(steps):
             start = max(0, frames.shape[1] - self.predictor.window)
-            following = self.predictor(frames[:, start:], actions[:, start : frames.shape[1]])[:, -1]
+            window = frames[:, start:]
+            conditioning = self.predictor_actions(window, actions[:, start : frames.shape[1]])
+            following = self.predictor(window, conditioning)[:, -1]
             frames = torch.cat((frames, following[:, None]), dim=1)
         return frames[:, context.shape[1] :]
 
@@ -173,7 +236,9 @@ class LeWorldModel(nn.Module):
         z = self.encode(batch["images"], proprio)
         losses = {
             # Teacher-forced next-latent loss at every position, in parallel.
-            "pred_loss": F.mse_loss(self.predictor(z[:, :-1], actions), z[:, 1:]),
+            "pred_loss": F.mse_loss(
+                self.predictor(z[:, :-1], self.predictor_actions(z[:, :-1], actions)), z[:, 1:]
+            ),
             # Per-timestep SIGReg over the batch (samples, not frames, are i.i.d.).
             "sigreg_loss": sigreg(z.transpose(0, 1), slices=self.sigreg_slices),
         }

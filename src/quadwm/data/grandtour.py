@@ -139,22 +139,60 @@ def pool_depth(depth_m: np.ndarray, size: int, depth_range: tuple[float, float])
     return torch.cat((mean / coverage.clamp_min(1e-6), coverage), dim=1)[0]
 
 
-def normalization_stats(readers: list[MissionReader], action_frames: int) -> dict[str, list[float]]:
+def _std(values: np.ndarray) -> np.ndarray:
+    return np.maximum(values.std(axis=0), 1e-6)
+
+
+def normalization_stats(
+    readers: list[MissionReader], action_frames: int, control_hz: float | None = None
+) -> dict[str, list[float]]:
     """Per-dimension mean/std of model inputs over training missions (recipe §2.3).
 
     Computed over every logged sample rather than only the sampled windows, so
     it is cheap and independent of window settings.  Actions are per-joint
-    statistics tiled over the ``action_frames`` stacked commands.
+    statistics tiled over the ``action_frames`` stacked commands.  With
+    ``control_hz``, also the joint-residual statistics (``command_residual_stats``).
     """
     proprio = np.concatenate([reader.proprio_vectors for reader in readers])
     actions = np.concatenate([reader.actions for reader in readers])
-    std = lambda values: np.maximum(values.std(axis=0), 1e-6)
-    return {
+    stats = {
         "proprio_mean": proprio.mean(axis=0).tolist(),
-        "proprio_std": std(proprio).tolist(),
+        "proprio_std": _std(proprio).tolist(),
         "action_mean": np.tile(actions.mean(axis=0), action_frames).tolist(),
-        "action_std": np.tile(std(actions), action_frames).tolist(),
+        "action_std": np.tile(_std(actions), action_frames).tolist(),
     }
+    if control_hz is not None:
+        stats |= command_residual_stats(readers, action_frames, control_hz)
+    return stats
+
+
+def command_residual_stats(
+    readers: list[MissionReader], action_frames: int, control_hz: float, samples_per_mission: int = 4096
+) -> dict[str, list[float]]:
+    """Mean/std of ``command(t + f / control_hz) - joint_pos(t)`` per (frame f, joint): [action_frames * 12].
+
+    The joint-residual action input (``LeWorldModel(action_input="joint_residual")``,
+    docs/adr/0007) expresses a tick's command window relative to the joint
+    positions at that tick, so its scale grows with the frame offset; these
+    statistics are taken over exactly that layout. Ticks are evenly spaced
+    estimator samples, skipping any whose command window has a gap.
+    """
+    offsets = np.arange(action_frames, dtype=np.float64) / control_hz
+    residuals = []
+    for reader in readers:
+        count = min(samples_per_mission, len(reader.proprio_timestamps))
+        if not count:
+            continue
+        ticks = np.linspace(0, len(reader.proprio_timestamps) - 1, count).astype(int)
+        times = reader.proprio_timestamps[ticks].astype(np.float64)
+        command_ids, gaps = _nearest_indices(reader.actuator_timestamps, times[:, None] + offsets[None, :])
+        valid = (gaps <= reader.max_gap_s).all(axis=1)
+        joints = reader.proprio["joint_positions"][ticks[valid]]
+        residuals.append((reader.actions[command_ids[valid]] - joints[:, None, :]).reshape(len(joints), -1))
+    if not residuals or not sum(len(part) for part in residuals):
+        raise ValueError("no gap-free command windows to compute joint-residual statistics from")
+    values = np.concatenate(residuals)
+    return {"residual_mean": values.mean(axis=0).tolist(), "residual_std": _std(values).tolist()}
 
 
 # --------------------------------------------------------------------------

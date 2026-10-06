@@ -325,3 +325,64 @@ def test_sharded_sim_eval_merges_back_into_the_full_result(tmp_path, monkeypatch
 
     with pytest.raises(ValueError, match="more than one"):  # the full file plus a shard double-counts ev3
         merge_sim_shards([json.loads((folder / "last-sim-smoke.json").read_text("utf-8")), shards[1]])
+
+
+def _toy_sim_config() -> dict:
+    return SIM_CONFIG | {"camera": SIM_CONFIG["camera"] | {"modalities": ["depth"]}}
+
+
+def test_residual_noise_is_held_per_tick_and_absent_by_default():
+    from quadwm.sim.episodes import collect_episode
+
+    def episode(**noise):
+        controller = build_controller(SIM_CONFIG, {"frequency_hz": 1.5})
+        return collect_episode(_ToySim(_toy_sim_config()), controller, seed=5, terrain=TerrainSpec(), ticks=6,
+                               command_mps=0.3, heading_change_rad=0.0, action_noise_rad=0.0, **noise)
+
+    plain = episode()
+    np.testing.assert_array_equal(plain["actions"], episode(residual_noise_rad=0.0)["actions"])
+    offset = (episode(residual_noise_rad=0.1)["actions"] - plain["actions"]).reshape(5, 10, 12)
+    np.testing.assert_allclose(offset, np.repeat(offset[:, :1], 10, axis=1), atol=1e-6)  # one offset per tick
+    assert 0.03 < offset[:, 0].std() < 0.3
+
+
+def _finetune_episodes(tmp_path) -> tuple[Path, dict]:
+    path = tmp_path / "finetune_episodes.yaml"
+    path.write_text(Path("configs/sim/finetune_episodes.yaml").read_text(encoding="utf-8")
+                    .replace("sim_config: mujoco_anymal.yaml",
+                             f"sim_config: {Path('configs/sim/mujoco_anymal.yaml').resolve().as_posix()}"),
+                    encoding="utf-8")
+    config = load_config(path)
+    spec = config["episodes"] | {"cache_root": str(tmp_path / "episodes"), "ticks": 12,
+                                 "terrains": [["flat", 0.0]], "train_seeds": [1000, 1001]}
+    path.write_text(json.dumps(config | {"episodes": spec}), encoding="utf-8")  # JSON is YAML
+    return path, load_config(path)
+
+
+def test_finetune_windows_come_only_from_rendered_episodes(tmp_path, monkeypatch):
+    from quadwm import training
+    from quadwm.evaluation import sim_protocol
+    from quadwm.sim.episodes import episode_set
+
+    path, episodes_cfg = _finetune_episodes(tmp_path)
+    sim_cfg = load_config(Path("configs/sim/mujoco_anymal.yaml"))["sim"]
+    with pytest.raises(FileNotFoundError, match="sim-collect"):
+        episode_set(None, None, sim_cfg, episodes_cfg["controller"], episodes_cfg["episodes"], "train",
+                    collect=False)
+
+    monkeypatch.setattr(sim_protocol, "build_simulator", _ToySim)
+    rendered = sim_protocol.collect_episodes(episodes_cfg)
+    assert list(rendered) == ["train"] and len(rendered["train"]) == 2
+    assert "rgb" not in np.load(rendered["train"][0]).files  # depth only
+
+    norm = {"proprio_mean": [0.0] * 33, "proprio_std": [1.0] * 33, "action_mean": [0.0] * 120,
+            "action_std": [1.0] * 120}
+    config = {"finetune": {"sim_episodes": str(path), "sim_repeat": 3},
+              "model": {"context_steps": 2, "rollout_steps": 2},
+              "data": {"observation": "depth_plus_proprioception", "normalization": norm, "depth_size": 16}}
+    windows = training._sim_dataset(config)
+    per_copy = (12 - 4 + 1) * 2  # stride 1, two fall-free episodes
+    assert len(windows) == 3 * per_copy
+    item = windows[0]
+    assert item["images"].shape == (4, 2, 16, 16) and item["actions"].shape == (3, 120)
+    assert training._sim_dataset({"finetune": {}}) is None

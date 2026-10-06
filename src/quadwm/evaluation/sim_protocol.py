@@ -341,10 +341,15 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
 
 
 def collect_episodes(sim_eval_config: dict) -> dict[str, list[Path]]:
-    """Render and cache the EV1-sim episodes without a model (`quadwm sim-collect`, CPU only)."""
+    """Render and cache a config's episodes without a model (`quadwm sim-collect`, CPU only).
+
+    The EV1-sim probe/eval episodes by default; a config whose ``episodes`` block names
+    ``splits`` and ``modalities`` (the fine-tuning set, docs/adr/0007) renders those instead.
+    """
     sim_cfg = load_config(referenced_path(sim_eval_config, sim_eval_config["sim_config"]))["sim"]
-    controller_cfg = sim_eval_config["controller"]
-    return {split: episode_set(lambda: build_simulator(_rendered(sim_cfg, ["rgb", "depth"])),
+    controller_cfg, spec = sim_eval_config["controller"], sim_eval_config["episodes"]
+    modalities = spec.get("modalities", ["rgb", "depth"])
+    return {split: episode_set(lambda: build_simulator(_rendered(sim_cfg, modalities)),
                                lambda: build_controller(sim_cfg, controller_cfg),
-                               sim_cfg, controller_cfg, sim_eval_config["episodes"], split)
-            for split in ("probe", "eval")}
+                               sim_cfg, controller_cfg, spec, split)
+            for split in spec.get("splits", ("probe", "eval"))}
