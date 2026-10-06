@@ -43,6 +43,7 @@ lessons
 reference
 docs/*
 !docs/adr/
+!docs/results/
 
 # slurm job artifacs 
 *.out
