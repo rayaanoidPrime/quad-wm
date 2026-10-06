@@ -26,21 +26,27 @@ module load rocm/6.2.4
 
 cd "$PROJECT_DIR"
 
-# The cluster's gres.conf maps the 8 XCD partitions of physical GPU 0 as
-# "GPUs", so SLURM_JOB_GPUS is not a usable physical GPU index; Slurm's device
-# isolation also hides physical GPU 0 from what the job's runtime can open.
-# Pick the freest GPU(s) the job can actually see, instead of trusting the
-# allocation. Clear the visibility vars first so the runtime enumerates them all.
+# GPU_SELECT=freest (default, docs/adr/0001): the cluster's gres.conf once
+# mapped the 8 XCD partitions of physical GPU 0 as "GPUs", so SLURM_JOB_GPUS
+# was not a usable physical index; pick the freest GPU(s) the job can see.
+# GPU_SELECT=slurm: trust SLURM_JOB_GPUS, as the sim eval does since 8efbd77.
+# Use it when several jobs start together (scripts/slurm/lewm_pipeline.sh):
+# "freest" races and lands simultaneous jobs on the same card.
+GPU_SELECT="${GPU_SELECT:-freest}"
 unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
-export ROCR_VISIBLE_DEVICES="$(
-  GPUS="${SLURM_GPUS_ON_NODE:-1}" "$PROJECT_DIR/.venv/bin/python3" - <<'PY'
+if [[ "$GPU_SELECT" == slurm && -n "${SLURM_JOB_GPUS:-}" ]]; then
+  export ROCR_VISIBLE_DEVICES="${SLURM_JOB_GPUS// /,}"
+else
+  export ROCR_VISIBLE_DEVICES="$(
+    GPUS="${SLURM_GPUS_ON_NODE:-1}" "$PROJECT_DIR/.venv/bin/python3" - <<'PY'
 import os, torch
 want = int(os.environ.get("GPUS", "1"))
 ranked = sorted(range(torch.cuda.device_count()),
                 key=lambda i: torch.cuda.mem_get_info(i)[0], reverse=True)
 print(",".join(map(str, sorted(ranked[:want]))))
 PY
-)"
+  )"
+fi
 unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 echo "[$(date -Is)] gpus: SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-unset} HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset}"
 rocm-smi --showmemuse --showpids 2>/dev/null || true
