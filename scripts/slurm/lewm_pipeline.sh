@@ -35,8 +35,8 @@ TRAIN_GPUS="${TRAIN_GPUS:-4}"
 DRY_RUN="${DRY_RUN:-0}"
 export PROJECT_DIR QUADWM_STORAGE_ROOT="$STORAGE_ROOT" RUN_ROOT
 export GPU_SELECT="${GPU_SELECT:-slurm}"
-REFERENCE_EVALS="${REFERENCE_EVALS:-$(ls "$RUN_ROOT"/lewm-depth/eval/last-protocol-v1.json \
-  "$RUN_ROOT"/lewm-depth/eval/last-sim-protocol-v2*.json 2>/dev/null | tr '\n' ' ' || true)}"
+REFERENCE_EVALS="${REFERENCE_EVALS:-$(ls "$STORAGE_ROOT"/runs/lewm/lewm-depth/eval/last-protocol-v1.json \
+  "$STORAGE_ROOT"/runs/lewm/lewm-depth/eval/last-sim-protocol-v2*.json 2>/dev/null | tr '\n' ' ' || true)}"
 
 declare -A CONFIGS=(
   [grounded]=configs/jepa-wm/lewm_depth_grounded.yaml
