@@ -2,7 +2,7 @@
 # (CEM planning), EV4, EV6, in MuJoCo with the scripted trot controller.
 # One file for every model compared; changing it changes the protocol, so
 # bump `name` and record why.
-name: sim-protocol-v1
+name: sim-protocol-v2
 seed: 4551
 # Horizons, context, probe architecture/budget, sigma floor: identical to the
 # real-data eval so EV1-sim and EV5 share a probe procedure (for Δ_s2r).
@@ -28,12 +28,12 @@ episodes:                      # EV1-sim trajectories, rendered once and cached 
   action_noise_rad: 0.03       # recipe: action noise for coverage
   window_stride_ticks: 10
 
-planning:                      # EV3 CEM (protocol §4.2: 300 candidates, 30 elites, 10 iterations)
-  probe: mlp                   # frozen sim probe that scores predicted latents
-  horizon_ticks: 6             # baseline recipe H = 6
-  population: 300
-  elites: 30
-  iterations: 10
+planning:                      # EV3 CEM. Protocol §4.2's 300/30/10 is infeasible for the
+  probe: mlp                   # V-JEPA baseline (576-token candidates, ~90h/45 episodes), so
+  horizon_ticks: 6             # ADR 0006 addendum (2026-10-06) cuts the search: 32/4/4 and two
+  population: 32               # seeds per tier. Applies to every model, or the budgets differ.
+  elites: 4
+  iterations: 4
   init_std: 0.1                # rad, per-joint residual on top of the controller
   min_std: 0.01
   max_residual_rad: 0.3
@@ -57,7 +57,7 @@ ev2:                           # protocol §3
   seed: 4551
 
 ev3:                           # protocol §4.3 terrain suite
-  seeds: [0, 1, 2]
+  seeds: [0, 1]
   max_level_success: 0.5
   tiers:
     - {name: "1-flat", kind: flat, levels: [0.0], metric: tracking}
@@ -69,7 +69,7 @@ ev3:                           # protocol §4.3 terrain suite
 
 ev4:                           # protocol §5 grid, on EV3 planning
   terrain: [rough, 0.02]
-  seeds: [0, 1, 2]
+  seeds: [0, 1]
   mass_percent: [-30, -15, 15, 30]
   friction_scale: [0.4, 1.5, 2.5]
   latency_ms: [10, 25, 50]
@@ -79,4 +79,4 @@ ev4:                           # protocol §5 grid, on EV3 planning
 
 ev6:                           # protocol §7, unilateral_steps original vs mirrored
   level: 0.1
-  seeds: [0, 1, 2]
+  seeds: [0, 1]

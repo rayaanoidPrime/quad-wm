@@ -110,3 +110,19 @@ recipes assume:
 - The baseline predictor computes AdaLN modulation once per frame and
   attends block by block over the frames its window allows. Outputs are
   unchanged (tests compare against the dense-mask reference); it is faster.
+
+## Addendum (2026-10-06b): reduced CEM budget, sim-protocol-v2
+
+- Protocol §4.2's CEM budget (300 candidates, 30 elites, 10 iterations) does
+  not fit a share of a day for a model whose candidate is a 576-token x
+  3-frame predictor rollout. A sharded run on dedicated MI300X cards finished
+  only tier 1 of EV3 in ~7 h (~1-2 h per planning episode, ~45-90 h for EV3
+  alone), so the 23 h wall would kill every baseline planning shard with no
+  JSON written.
+- `configs/eval/sim.yaml` is bumped to `sim-protocol-v2`: population 300->32,
+  elites 30->4, iterations 10->4, and EV3/EV4/EV6 seeds 3->2, ~35x fewer
+  planner rollouts. This changes the planning metric, so it applies to every
+  model; LeWM is re-run under v2 and v1 planning numbers are not comparable.
+- Consequence: EV3 fall/success/max-level rates are over two seeds and the
+  CEM search is weaker (fewer samples, fewer refit rounds). EV1-sim, EV2 and
+  the controller-only arm are unchanged.
