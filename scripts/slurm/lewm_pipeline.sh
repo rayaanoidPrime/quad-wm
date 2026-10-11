@@ -8,7 +8,9 @@
 #   per seed:  grounded train ──> eval + sim-eval[0-2]       │
 #              residual train ──> eval + sim-eval[0-2]       │
 #                     └──> simft train (needs both) ──> eval + sim-eval[0-2]
+#                                                      + sim-lewm[0-2] (ADR 0008)
 #   report (after every eval ends, ok or not)
+#   sim-lewm report (its own: sim-lewm-v1 never shares a table with v2)
 #
 # afterok edges with --kill-on-invalid-dep: a failed job cancels what depends
 # on it instead of leaving it pending forever; the report still runs.
@@ -22,6 +24,8 @@
 #                                    when jobs start together
 #   REFERENCE_EVALS=...              extra eval JSONs for the report (default:
 #                                    the original lewm-depth run's, if present)
+#   LEWM_SIM_ARMS="simft"            arms that also get the LeWM-only planning eval
+#                                    (configs/eval/sim_lewm.yaml, EV3/EV4/EV6); "" skips it
 #   DRY_RUN=1                        print the sbatch commands, submit nothing
 set -euo pipefail
 
@@ -33,6 +37,9 @@ ARMS="${ARMS:-grounded residual simft}"
 RUN_ROOT="${RUN_ROOT:-$STORAGE_ROOT/runs/lewm-depth}"
 TRAIN_GPUS="${TRAIN_GPUS:-4}"
 DRY_RUN="${DRY_RUN:-0}"
+LEWM_SIM_ARMS="${LEWM_SIM_ARMS-simft}"
+LEWM_SIM_CONFIG=configs/eval/sim_lewm.yaml
+LEWM_SIM_NAME=sim-lewm-v1  # its `name`; the report collects last-<name>*.json
 export PROJECT_DIR QUADWM_STORAGE_ROOT="$STORAGE_ROOT" RUN_ROOT
 export GPU_SELECT="${GPU_SELECT:-slurm}"
 REFERENCE_EVALS="${REFERENCE_EVALS:-$(ls "$STORAGE_ROOT"/runs/lewm/lewm-depth/eval/last-protocol-v1.json \
@@ -93,6 +100,8 @@ echo "sim-collect: $collect_id"
 
 eval_ids=()
 run_names=()
+lewm_eval_ids=()
+lewm_run_names=()
 for seed in $SEEDS; do
   declare -A train_id=()
   for arm in $ARMS; do
@@ -115,6 +124,12 @@ for seed in $SEEDS; do
       scripts/slurm/jepa_sim_eval.sbatch)"
     eval_ids+=("$real_id" "$sim_id")
     echo "$name: train=${train_id[$arm]} eval=$real_id sim-eval=$sim_id"
+    if [[ " $LEWM_SIM_ARMS " == *" $arm "* ]]; then
+      lewm_id="$(submit CONFIG="$config" QUADWM_SEED="$seed" SIM_EVAL_CONFIG="$LEWM_SIM_CONFIG"         ONLY_SETS="ev3 ev4 ev6" -- --job-name="sim-lewm-$name" --array=0-2         $(after afterok "${train_id[$arm]}" $collect_id) scripts/slurm/jepa_sim_eval.sbatch)"
+      lewm_eval_ids+=("$real_id" "$lewm_id")
+      lewm_run_names+=("$name")
+      echo "$name: sim-lewm=$lewm_id"
+    fi
   done
   unset train_id
 done
@@ -122,4 +137,8 @@ done
 report_id="$(submit RUN_NAMES="${run_names[*]}" REFERENCE_EVALS="$REFERENCE_EVALS" -- \
   --job-name=report-lewm-pipeline $(after afterany "${eval_ids[@]}") scripts/slurm/jepa_report.sbatch)"
 echo "report: $report_id -> $RUN_ROOT/reports/report-$report_id.md"
+if (( ${#lewm_run_names[@]} )); then
+  lewm_report_id="$(submit RUN_NAMES="${lewm_run_names[*]}" SIM_NAME="$LEWM_SIM_NAME" REFERENCE_EVALS="" --     --job-name=report-lewm-planning $(after afterany "${lewm_eval_ids[@]}") scripts/slurm/jepa_report.sbatch)"
+  echo "sim-lewm report: $lewm_report_id -> $RUN_ROOT/reports/report-$lewm_report_id.md"
+fi
 echo "watch: squeue -u \$USER -o '%.10i %.30j %.8T %.20E'"

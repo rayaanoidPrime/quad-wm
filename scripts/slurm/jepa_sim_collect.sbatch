@@ -35,8 +35,16 @@ if [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
 fi
 export QUADWM_SIM_ASSETS="${QUADWM_SIM_ASSETS:-$STORAGE_ROOT/assets}"
 export QUADWM_SIM_CACHE_ROOT="${QUADWM_SIM_CACHE_ROOT:-$STORAGE_ROOT/cache/sim-episodes}"
-# Headless rendering. If EGL is unavailable on the node, try MUJOCO_GL=osmesa.
+# Headless rendering. EGL segfaults on import on the MI300X node (the amdgpu-pro
+# libGL shadows Mesa's), so prefer the OSMesa build kept in $QUADWM_SIM_ASSETS/lib
+# whenever it is there; MUJOCO_GL=egl still overrides.
+if [[ -z "${MUJOCO_GL:-}" && -e "$QUADWM_SIM_ASSETS/lib/libOSMesa.so.8" ]]; then
+  export MUJOCO_GL=osmesa
+fi
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+if [[ "$MUJOCO_GL" == osmesa && -d "$QUADWM_SIM_ASSETS/lib" ]]; then
+  export LD_LIBRARY_PATH="$QUADWM_SIM_ASSETS/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 mkdir -p logs "$QUADWM_SIM_ASSETS" "$QUADWM_SIM_CACHE_ROOT"
 export QUADWM_GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
