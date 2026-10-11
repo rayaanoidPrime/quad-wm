@@ -20,8 +20,8 @@
 #   ARMS="grounded residual simft"   simft needs residual for the same seeds
 #   RUN_ROOT=$STORAGE_ROOT/runs/lewm-depth   next to the original LeWM run
 #   TRAIN_GPUS=4                     GPUs per training job (DDP ranks)
-#   GPU_SELECT=slurm                 see jepa_baseline.sbatch; "freest" races
-#                                    when jobs start together
+#   GPU_SELECT=slurm                 eval jobs (1 GPU); see jepa_baseline.sbatch
+#   TRAIN_GPU_SELECT=freest          training jobs: "slurm" breaks multi-GPU RCCL here
 #   REFERENCE_EVALS=...              extra eval JSONs for the report (default:
 #                                    the original lewm-depth run's, if present)
 #   LEWM_SIM_ARMS="simft"            arms that also get the LeWM-only planning eval
@@ -42,6 +42,11 @@ LEWM_SIM_CONFIG=configs/eval/sim_lewm.yaml
 LEWM_SIM_NAME=sim-lewm-v1  # its `name`; the report collects last-<name>*.json
 export PROJECT_DIR QUADWM_STORAGE_ROOT="$STORAGE_ROOT" RUN_ROOT
 export GPU_SELECT="${GPU_SELECT:-slurm}"
+# Multi-GPU training must not trust SLURM_JOB_GPUS: inside the job's device cgroup
+# those indices break RCCL topology discovery ("Failed to find reverse path",
+# jobs 2662-2675), while "freest" works (job 2694). 4-GPU trains cannot run two at
+# a time on the free cards, so freest's start race does not arise for them.
+TRAIN_GPU_SELECT="${TRAIN_GPU_SELECT:-freest}"
 REFERENCE_EVALS="${REFERENCE_EVALS:-$(ls "$STORAGE_ROOT"/runs/lewm/lewm-depth/eval/last-protocol-v1.json \
   "$STORAGE_ROOT"/runs/lewm/lewm-depth/eval/last-sim-protocol-v2*.json 2>/dev/null | tr '\n' ' ' || true)}"
 
@@ -91,7 +96,7 @@ after() {  # after <type> <ids...> -> --dependency flag, or nothing for no ids
 }
 
 GIT_COMMIT="$(git rev-parse HEAD)"
-echo "pipeline: commit=$GIT_COMMIT seeds=($SEEDS) arms=($ARMS) run_root=$RUN_ROOT train_gpus=$TRAIN_GPUS gpu_select=$GPU_SELECT"
+echo "pipeline: commit=$GIT_COMMIT seeds=($SEEDS) arms=($ARMS) run_root=$RUN_ROOT train_gpus=$TRAIN_GPUS gpu_select=$GPU_SELECT train_gpu_select=$TRAIN_GPU_SELECT"
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || echo "warning: uncommitted changes; runs record $GIT_COMMIT" >&2
 
 # Fine-tuning episodes + EV1-sim episodes; a no-op when both are cached.
@@ -113,7 +118,7 @@ for seed in $SEEDS; do
       [[ -n "${train_id[residual]:-}" ]] && deps+=("${train_id[residual]}")
       deps+=("$collect_id")
     fi
-    train_id[$arm]="$(submit CONFIG="$config" QUADWM_SEED="$seed" -- \
+    train_id[$arm]="$(submit CONFIG="$config" QUADWM_SEED="$seed" GPU_SELECT="$TRAIN_GPU_SELECT" -- \
       --job-name="train-$name" --gres="gpu:$TRAIN_GPUS" $(after afterok "${deps[@]}") \
       scripts/slurm/jepa_baseline.sbatch)"
     real_id="$(submit CONFIG="$config" QUADWM_SEED="$seed" -- \

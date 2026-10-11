@@ -28,8 +28,9 @@ cd "$PROJECT_DIR"
 # mapped the 8 XCD partitions of physical GPU 0 as "GPUs", so SLURM_JOB_GPUS
 # was not a usable physical index; pick the freest GPU(s) the job can see.
 # GPU_SELECT=slurm: trust SLURM_JOB_GPUS, as the sim eval does since 8efbd77.
-# Use it when several jobs start together (scripts/slurm/lewm_pipeline.sh):
-# "freest" races and lands simultaneous jobs on the same card.
+# Single-GPU jobs only: with several GPUs, RCCL fails topology discovery under
+# these indices inside the job cgroup (2026-10-12, jobs 2662-2675 vs 2694), so
+# multi-GPU training keeps freest (lewm_pipeline.sh sets TRAIN_GPU_SELECT).
 GPU_SELECT="${GPU_SELECT:-freest}"
 unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 if [[ "$GPU_SELECT" == slurm && -n "${SLURM_JOB_GPUS:-}" ]]; then

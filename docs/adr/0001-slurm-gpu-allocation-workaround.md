@@ -170,3 +170,16 @@ This is a **workaround**, with a known ceiling:
 2. AMD device isolation must actually work (the devices cgroup is currently
    allow-all for jobs, and `/dev/kfd` is shared), otherwise GPU allocation stays
    advisory and non-Slurm workloads cannot be excluded.
+## Addendum (2026-10-12): `GPU_SELECT=slurm` is for single-GPU jobs only
+
+`8efbd77` made single-GPU sim evals trust `SLURM_JOB_GPUS` (`GPU_SELECT=slurm`),
+and `140f338` extended that to the LeWM pipeline's 4-GPU training jobs. On
+2026-10-12 every such training job (2662–2675, `SLURM_JOB_GPUS=3,4,5,6`) died in
+`init_process_group` with RCCL `Failed to find reverse path from remNode 0/9d000
+... to node 0/dd000`. A probe job (2694) reproduced it inside the allocation:
+torch sees 7 devices in the job cgroup, all-reduce over `ROCR_VISIBLE_DEVICES=
+$SLURM_JOB_GPUS` fails, and all-reduce over the 4 freest visible devices
+succeeds. The same GPU set 3,4,5,6 works outside Slurm. So the cgroup's device
+view and Slurm's indices still disagree enough to break multi-GPU topology
+discovery. Training therefore keeps `freest` (`TRAIN_GPU_SELECT` in
+`lewm_pipeline.sh`), and `slurm` stays for single-GPU eval jobs.
