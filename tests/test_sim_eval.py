@@ -170,11 +170,13 @@ class _ToySim:
         return observation
 
 
-def _tiny_run(tmp_path) -> tuple[dict, Path]:
+def _tiny_run(tmp_path, loss_weights: dict | None = None) -> tuple[dict, Path]:
     model_cfg = {"type": "lewm", "image_size": 16, "patch_size": 8, "encoder_dim": 16, "encoder_depth": 1,
                  "encoder_heads": 2, "latent_dim": 8, "predictor_dim": 16, "predictor_depth": 1,
                  "predictor_heads": 2, "predictor_window": 2, "proprio_dim": 33, "action_dim": 120,
                  "context_steps": 2, "rollout_steps": 1, "sigreg_slices": 8}
+    if loss_weights:
+        model_cfg["loss_weights"] = loss_weights
     norm = {"proprio_mean": [0.0] * 33, "proprio_std": [1.0] * 33, "action_mean": [0.0] * 120,
             "action_std": [1.0] * 120}
     config = {"name": "sim-run", "seed": 3, "run_root": str(tmp_path / "runs"), "checkpoint_root": str(tmp_path),
@@ -386,3 +388,130 @@ def test_finetune_windows_come_only_from_rendered_episodes(tmp_path, monkeypatch
     item = windows[0]
     assert item["images"].shape == (4, 2, 16, 16) and item["actions"].shape == (3, 120)
     assert training._sim_dataset({"finetune": {}}) is None
+
+
+def _reference_cem(cost, shape, *, population, elites, iterations, init_std, min_std, clip, generator):
+    """sim-protocol-v2's CEM, verbatim, so the new options cannot drift its default behaviour."""
+    mean, std = torch.zeros(shape), torch.full(shape, init_std)
+    for _ in range(iterations):
+        samples = (mean + std * torch.randn((population, *shape), generator=generator)).clamp(-clip, clip)
+        best = samples[torch.topk(cost(samples), elites, largest=False).indices]
+        mean, std = best.mean(0), best.std(0).clamp_min(min_std)
+    return mean
+
+
+def test_cem_defaults_reproduce_the_v2_planner_exactly():
+    target = torch.tensor([[0.2, -0.1], [0.05, 0.15]])
+
+    def cost(samples):
+        return (samples - target).pow(2).sum((1, 2))
+
+    kwargs = {"population": 16, "elites": 4, "iterations": 3, "init_std": 0.3, "min_std": 1e-3, "clip": 1.0}
+    expected = _reference_cem(cost, (2, 2), generator=torch.Generator().manual_seed(5), **kwargs)
+    actual = cem(cost, (2, 2), generator=torch.Generator().manual_seed(5), **kwargs)
+    assert torch.equal(actual, expected)
+
+
+def test_cem_guards_score_the_controller_and_return_the_best_candidate():
+    scored = []
+
+    def cost(samples):  # minimum exactly at zero residual: the controller alone
+        values = samples.pow(2).sum((1, 2)) + 1.0
+        scored.append(values.min())
+        return values
+
+    kwargs = {"population": 8, "elites": 2, "iterations": 3, "init_std": 0.3, "min_std": 1e-3, "clip": 1.0,
+              "generator": torch.Generator().manual_seed(0)}
+    unguarded = cem(cost, (3, 2), **kwargs)
+    assert unguarded.abs().sum() > 0, "the elite mean never lands exactly on zero"
+    scored.clear()
+    guarded = cem(cost, (3, 2), keep_mean=True, keep_zero=True, return_best=True, std_momentum=0.5,
+                  **(kwargs | {"generator": torch.Generator().manual_seed(0)}))
+    assert torch.equal(guarded, torch.zeros(3, 2))
+    assert min(scored) == pytest.approx(1.0)
+
+
+def test_cem_return_best_returns_a_scored_candidate():
+    seen = []
+
+    def cost(samples):
+        seen.append(samples.clone())
+        return (samples - 0.25).pow(2).sum((1, 2))
+
+    best = cem(cost, (2, 3), population=8, elites=2, iterations=3, init_std=0.3, min_std=1e-3, clip=1.0,
+               return_best=True, generator=torch.Generator().manual_seed(1))
+    candidates = torch.cat(seen)
+    assert (candidates == best).all((1, 2)).any(), "return_best must return something that was scored"
+    assert cost(best[None]) <= cost(candidates).min() + 1e-7
+
+
+class _HeadModel(torch.nn.Module):
+    context_steps = 2
+
+    def __init__(self, with_head: bool = True):
+        super().__init__()
+        self.state_head = torch.nn.Linear(4, 33) if with_head else None
+        if with_head:
+            torch.nn.init.zeros_(self.state_head.weight)
+            torch.nn.init.constant_(self.state_head.bias, 1.0)  # standardized proprio = 1 everywhere
+
+
+def _planner(model, readout):
+    from quadwm.evaluation.planning import Planner
+
+    norm = {"proprio_mean": [float(i) for i in range(33)], "proprio_std": [2.0] * 33,
+            "action_mean": [0.0] * 120, "action_std": [1.0] * 120}
+    return Planner(model=model, probe=None, normalization=norm, modality="depth", depth_size=16,
+                   depth_range=(0.2, 10.0), config={"horizon_ticks": 2, "seed": 0}, device=torch.device("cpu"),
+                   precision=torch.float32, readout=readout)
+
+
+def test_state_head_readout_unnormalizes_into_the_state_layout():
+    from quadwm.data.grandtour import PROPRIO_LAYOUT
+
+    states = _planner(_HeadModel(), "state_head")._state_head_states(torch.zeros(5, 2, 4))
+    assert states.shape == (5, 2, 40)
+    raw = 1.0 * 2.0 + torch.arange(33.0)  # head output * std + mean
+    for key, source in PROPRIO_LAYOUT.items():
+        assert torch.equal(states[0, 0, STATE_LAYOUT[key]], raw[source]), key
+    assert states[..., STATE_LAYOUT["base_pos"]].isnan().all() and states[..., STATE_LAYOUT["contacts"]].isnan().all()
+    assert locomotion_cost(states, 0.4, {"velocity": 1.0, "upright": 1.0, "yaw_rate": 0.1}).isfinite().all()
+
+
+def test_state_head_readout_needs_a_state_head():
+    with pytest.raises(ValueError, match="state head"):
+        _planner(_HeadModel(with_head=False), "state_head")
+    with pytest.raises(ValueError, match="readout"):
+        _planner(_HeadModel(), "decoder")
+
+
+def test_lewm_planning_config_differs_from_the_protocol_only_in_planning():
+    protocol = load_config(Path("configs/eval/sim.yaml"))
+    variant = load_config(Path("configs/eval/sim_lewm.yaml"))
+    differing = {key for key in protocol.keys() | variant.keys() if protocol.get(key) != variant.get(key)}
+    assert differing == {"name", "model_types", "planning", "config_path"}
+    shared = {key: value for key, value in protocol["planning"].items()
+              if key not in {"population", "elites", "iterations"}}
+    assert shared.items() <= variant["planning"].items(), "only the budget and the new options change"
+
+
+def test_sim_eval_runs_one_planning_arm_per_readout(tmp_path, monkeypatch):
+    from quadwm.evaluation import sim_protocol
+    from quadwm.evaluation.report import build_report
+
+    monkeypatch.setattr(sim_protocol, "build_simulator", _ToySim)
+    config, sim_eval = _tiny_run(tmp_path, loss_weights={"state": 1.0})
+    sim_eval["planning"] |= {"readouts": ["probe", "state_head"], "keep_zero": True, "return_best": True}
+    sim_eval["model_types"] = ["lewm"]
+
+    result = sim_protocol.evaluate_in_sim(config, sim_eval, only=["ev3", "ev4", "ev6"])
+
+    arms = {"planning", "planning_state_head", "controller"}
+    assert result["planning"]["arms"] == ["planning", "planning_state_head"]
+    assert set(result["ev3"]["1-flat"]["summary"]) == arms
+    assert set(result["ev4"]["retention_percent"]) == arms and set(result["ev6"]["ratio"]) == arms
+    assert "planning_state_head" in build_report([json.loads(json.dumps(result))])
+
+    sim_eval["model_types"] = ["jepa"]
+    with pytest.raises(ValueError, match="model types"):
+        sim_protocol.evaluate_in_sim(config, sim_eval, only=["ev3"])

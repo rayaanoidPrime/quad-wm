@@ -165,6 +165,18 @@ def _delta_s2r(real: list[dict], sim: list[dict]) -> list[str]:
             *_table(["group", "probe", *[f"k={k}" for k in horizons]], rows)]
 
 
+def _arms(members: list[dict], per_arm) -> list[str]:
+    """Arms every member reports, in the first member's order (planning arms, then the controller).
+
+    sim-protocol-v2 has "planning" and "controller"; a config with ``planning.readouts`` adds
+    more planning arms (docs/adr/0008). An arm some seeds lack would mix n, so it is an error.
+    """
+    arms = [list(per_arm(member)) for member in members]
+    if any(set(names) != set(arms[0]) for names in arms):
+        raise ValueError(f"sim runs of one group report different arms: {arms}")
+    return arms[0]
+
+
 def _sim_sections(groups: dict[str, list[dict]]) -> list[str]:
     lines = []
     with_ev2 = {name: [m for m in members if "ev2" in m] for name, members in groups.items()}
@@ -186,7 +198,7 @@ def _sim_sections(groups: dict[str, list[dict]]) -> list[str]:
         for tier, spec in first["ev3"].items():
             metric_key = {"tracking": "tracking_error_mps", "success": "success_rate", "max_level": "max_level"}[spec["metric"]]
             for name, members in with_ev3.items():
-                for arm in ("planning", "controller"):
+                for arm in _arms(members, lambda m, tier=tier: m["ev3"][tier]["summary"]):
                     values = [_get(m["ev3"][tier]["summary"][arm], (metric_key, "mean"))
                               if spec["metric"] == "tracking" else m["ev3"][tier]["summary"][arm][metric_key]
                               for m in members]
@@ -197,16 +209,18 @@ def _sim_sections(groups: dict[str, list[dict]]) -> list[str]:
     with_ev4 = {name: [m for m in members if "ev4" in m] for name, members in groups.items()}
     if any(with_ev4.values()):
         first = next(m for members in with_ev4.values() for m in members)
-        conditions = list(first["ev4"]["retention_percent"]["planning"])
+        conditions = list(first["ev4"]["retention_percent"]["controller"])
         rows = [[name, arm, *[_cell([m["ev4"]["retention_percent"][arm][c] for m in members], 1) for c in conditions]]
-                for name, members in with_ev4.items() if members for arm in ("planning", "controller")]
+                for name, members in with_ev4.items() if members
+                for arm in _arms(members, lambda m: m["ev4"]["retention_percent"])]
         lines += ["", f"## EV4 retention (% of nominal forward progress) on {first['ev4']['terrain']}", "",
                   *_table(["group", "arm", *conditions], rows)]
     with_ev6 = {name: [m for m in members if "ev6" in m] for name, members in groups.items()}
     if any(with_ev6.values()):
         rows = [[name, arm, _cell([m["ev6"]["ratio"][arm]["success_ratio"] for m in members]),
                  _cell([m["ev6"]["ratio"][arm]["progress_ratio"] for m in members])]
-                for name, members in with_ev6.items() if members for arm in ("planning", "controller")]
+                for name, members in with_ev6.items() if members
+                for arm in _arms(members, lambda m: m["ev6"]["ratio"])]
         lines += ["", "## EV6 mirrored / original (unilateral steps)", "",
                   *_table(["group", "arm", "success ratio", "progress ratio"], rows)]
     return lines

@@ -10,7 +10,12 @@ For one checkpoint, in MuJoCo with the scripted trot controller:
   - EV4: retention of EV3 performance under the dynamics-shift grid.
   - EV6: unilateral-terrain success, original vs mirrored.
 The models were trained on GrandTour only, so every number here is
-zero-shot sim transfer with a stand-in robot (ANYmal C) and a pinhole camera.
+zero-shot sim transfer with a stand-in robot (ANYmal C) and a pinhole camera
+(except the sim fine-tune arm, docs/adr/0007).
+
+A config may list ``planning.readouts``: each adds a planning arm scored by
+that readout ("probe" -> "planning", "state_head" -> "planning_state_head"),
+and ``model_types`` restricts which checkpoints it accepts (docs/adr/0008).
 """
 
 from __future__ import annotations
@@ -41,7 +46,12 @@ from .planning import EpisodeSpec, Planner, run_episode
 from .probes import StateProbe
 
 EVALS = ("ev1", "ev2", "ev3", "ev4", "ev6")
-ARMS = ("planning", "controller")
+CONTROLLER_ARM = "controller"
+
+
+def planning_arm(readout: str) -> str:
+    """Result key of the planning arm scored by ``readout``; the probe arm keeps the protocol's name."""
+    return "planning" if readout == "probe" else f"planning_{readout}"
 
 
 def _mean_std(values: list[float]) -> dict:
@@ -63,18 +73,22 @@ def _summarize(episodes: list[dict]) -> dict:
 
 @dataclass
 class _Arms:
-    """Runs the same episodes with the planner and with the controller alone."""
+    """Runs the same episodes with each planner and with the controller alone."""
 
-    planner: Planner
+    planners: dict[str, Planner]  # arm name -> planner, in report order
     planning_sim: object  # renders the model's camera
     controller_sim: object  # renders nothing
     controller_factory: object
     spec: EpisodeSpec
 
+    @property
+    def names(self) -> list[str]:
+        return [*self.planners, CONTROLLER_ARM]
+
     def run(self, terrain: TerrainSpec, seeds: list[int], dynamics: DynamicsSpec = DynamicsSpec()) -> dict:
         results = {}
-        for arm, sim, planner in (("planning", self.planning_sim, self.planner),
-                                  ("controller", self.controller_sim, None)):
+        runs = [(arm, self.planning_sim, planner) for arm, planner in self.planners.items()]
+        for arm, sim, planner in (*runs, (CONTROLLER_ARM, self.controller_sim, None)):
             episodes = [run_episode(sim, self.controller_factory(), self.spec, terrain=terrain, seed=int(seed),
                                     planner=planner, dynamics=dynamics)
                         for seed in seeds]
@@ -175,7 +189,7 @@ def _ev3(arms: _Arms, cfg: dict) -> dict:
         levels = {f"{level:g}": arms.run(TerrainSpec(kind=tier["kind"], level=float(level)), cfg["seeds"])
                   for level in tier["levels"]}
         summary = {}
-        for arm in ARMS:
+        for arm in arms.names:
             summary[arm] = {"fall_rate": float(np.mean([result[arm]["fall_rate"] for result in levels.values()]))}
             if tier["metric"] == "tracking":
                 summary[arm]["tracking_error_mps"] = _mean_std([e["tracking_error_mps"] for result in levels.values()
@@ -216,7 +230,7 @@ def _ev4(arms: _Arms, cfg: dict) -> dict:
     terrain = TerrainSpec(kind=kind, level=float(level))
     conditions = {name: arms.run(terrain, cfg["seeds"], dynamics) for name, dynamics in _dynamics_grid(cfg).items()}
     retention = {}
-    for arm in ARMS:
+    for arm in arms.names:
         nominal = conditions["nominal"][arm]["progress_m"]["mean"]
         retention[arm] = {
             name: (100.0 * result[arm]["progress_m"]["mean"] / nominal) if nominal and nominal > 0 else None
@@ -231,7 +245,7 @@ def _ev6(arms: _Arms, cfg: dict) -> dict:
                             cfg["seeds"])
              for name, mirrored in (("original", False), ("mirrored", True))}
     ratio = {}
-    for arm in ARMS:
+    for arm in arms.names:
         original, mirrored = sides["original"][arm], sides["mirrored"][arm]
         ratio[arm] = {
             "success_ratio": (mirrored["success_rate"] / original["success_rate"]
@@ -255,6 +269,9 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
     protocol_cfg = load_config(referenced_path(sim_eval_config, sim_eval_config["protocol_config"]))
     seed = int(sim_eval_config["seed"])
     run_root, checkpoint, saved, device = open_checkpoint(config, checkpoint, seed)
+    model_type = saved["config"]["model"]["type"]
+    if (allowed := sim_eval_config.get("model_types")) and model_type not in allowed:
+        raise ValueError(f"{sim_eval_config['name']} evaluates only model types {allowed}, not {model_type!r}")
     data_cfg = saved["config"]["data"]
     normalization = data_cfg.get("normalization")
     modality = camera_modality(data_cfg["observation"])
@@ -299,9 +316,17 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
     probe_eval = evaluate_probes(collected, protocol_cfg, [path.stem for path in paths["eval"]], device)
 
     planning_cfg = sim_eval_config["planning"]
-    planner = Planner(model=model, probe=probe_eval.probes[planning_cfg["probe"]], normalization=normalization,
-                      modality=modality, depth_size=depth_size, depth_range=depth_range, config=planning_cfg,
-                      device=device, precision=precision)
+    readouts = list(planning_cfg.get("readouts", ["probe"]))
+    if len(set(readouts)) != len(readouts) or not readouts:
+        raise ValueError(f"planning.readouts must be distinct and non-empty, got {readouts}")
+    planners = {
+        planning_arm(readout): Planner(model=model, probe=probe_eval.probes[planning_cfg["probe"]],
+                                       normalization=normalization, modality=modality, depth_size=depth_size,
+                                       depth_range=depth_range, config=planning_cfg, device=device,
+                                       precision=precision, readout=readout)
+        for readout in readouts
+    }
+    planner = next(iter(planners.values()))  # EV2 passes its probes explicitly; any readout serves
     result = {
         "protocol": "recipes/shared_evaluation_protocol.md",
         "eval_config": sim_eval_config["name"],
@@ -314,6 +339,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
                  "context_frames": context_frames},
         "horizons": horizons,
         "evals": sorted(only),
+        "planning": {"arms": list(planners), "config": planning_cfg},
         "probes": probe_eval.results if "ev1" in only else {},
         "not_run": {
             "EV3_learned_policy": "actor-critic trained in imagination is not implemented; only the CEM "
@@ -327,7 +353,7 @@ def evaluate_in_sim(config: dict, sim_eval_config: dict, checkpoint: Path | None
                              build_simulator(_rendered(sim_cfg, [modality])), controller_factory,
                              sim_eval_config["ev2"], horizons)
     if only & {"ev3", "ev4", "ev6"}:
-        arms = _Arms(planner, build_simulator(_rendered(sim_cfg, [modality])), build_simulator(_rendered(sim_cfg, [])),
+        arms = _Arms(planners, build_simulator(_rendered(sim_cfg, [modality])), build_simulator(_rendered(sim_cfg, [])),
                      controller_factory, EpisodeSpec.from_config(sim_eval_config["control_episode"]))
         for name, evaluate in (("ev3", _ev3), ("ev4", _ev4), ("ev6", _ev6)):
             if name in only:

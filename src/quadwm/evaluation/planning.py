@@ -11,6 +11,9 @@ Departures from protocol §4.2, recorded in docs/adr/0006:
   - Cost: locomotion has no goal image, so candidates are scored by the
     frozen probe on predicted latents (velocity tracking, uprightness, yaw
     rate) instead of L2 to a goal latent.
+
+A LeWM-only variant (docs/adr/0008, configs/eval/sim_lewm.yaml) can also
+score with the model's own jointly trained state head (``readout="state_head"``).
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from ..data.grandtour import JOINT_ORDER, STATE_LAYOUT
+from ..data.grandtour import JOINT_ORDER, PROPRIO_LAYOUT, STATE_LAYOUT
 from ..sim.base import DynamicsSpec, TerrainSpec
 from ..sim.episodes import fallen, frame_images
 from ..tokens import model_inputs
@@ -31,21 +34,39 @@ from .probes import StateProbe
 from .rollout import rollout_latents
 
 JOINTS = len(JOINT_ORDER)  # residuals are per joint, held for every control frame of a tick
+READOUTS = ("probe", "state_head")
 
 
 def cem(cost, shape: tuple[int, ...], *, population: int, elites: int, iterations: int, init_std: float,
         min_std: float, clip: float, mean: Tensor | None = None, generator: torch.Generator | None = None,
-        device: torch.device | None = None) -> Tensor:
-    """Cross-entropy method: refit a diagonal Gaussian to the lowest-cost elites (protocol §4.2)."""
+        device: torch.device | None = None, std_momentum: float = 0.0, keep_mean: bool = False,
+        keep_zero: bool = False, return_best: bool = False) -> Tensor:
+    """Cross-entropy method: refit a diagonal Gaussian to the lowest-cost elites (protocol §4.2).
+
+    Options (docs/adr/0008; all off reproduces sim-protocol-v2 exactly, same noise draws):
+      - ``std_momentum``: std = m * old + (1 - m) * elite std, so few elites cannot collapse it at once.
+      - ``keep_mean`` / ``keep_zero``: the current mean and the all-zero candidate (the controller
+        alone, for residuals) replace the first samples of every iteration, so both are always scored.
+      - ``return_best``: return the lowest-cost candidate scored in any iteration, not the final
+        (never scored) elite mean.
+    """
     device = device or torch.device("cpu")
     mean = torch.zeros(shape, device=device) if mean is None else mean.to(device)
     std = torch.full(shape, init_std, device=device)
+    best_cost, best_sample = float("inf"), mean
     for _ in range(iterations):
         noise = torch.randn((population, *shape), generator=generator).to(device)
         samples = (mean + std * noise).clamp(-clip, clip)
-        best = samples[torch.topk(cost(samples), elites, largest=False).indices]
-        mean, std = best.mean(0), best.std(0).clamp_min(min_std)
-    return mean
+        anchors = ([mean.clamp(-clip, clip)] if keep_mean else []) + ([torch.zeros_like(mean)] if keep_zero else [])
+        for index, anchor in enumerate(anchors):
+            samples[index] = anchor
+        costs = cost(samples)
+        if return_best and float(costs.min()) < best_cost:
+            best_cost, best_sample = float(costs.min()), samples[int(costs.argmin())].clone()
+        elite = samples[torch.topk(costs, elites, largest=False).indices]
+        mean = elite.mean(0)
+        std = (std_momentum * std + (1.0 - std_momentum) * elite.std(0)).clamp_min(min_std)
+    return best_sample if return_best else mean
 
 
 def locomotion_cost(states: Tensor, command_mps: float, weights: dict) -> Tensor:
@@ -64,7 +85,11 @@ def locomotion_cost(states: Tensor, command_mps: float, weights: dict) -> Tensor
 @dataclass
 class Planner:
     """A frozen world model (with its frozen encoder, if any) + frozen probe, planning controller
-    residuals by CEM over ``config["horizon_ticks"]`` ticks."""
+    residuals by CEM over ``config["horizon_ticks"]`` ticks.
+
+    ``readout`` picks what turns predicted latents into the states the cost reads: the frozen
+    probe (the protocol's), or the model's own state head (LeWM grounded arms, docs/adr/0008).
+    """
 
     model: torch.nn.Module
     probe: StateProbe
@@ -75,8 +100,14 @@ class Planner:
     config: dict
     device: torch.device
     precision: torch.dtype
+    readout: str = "probe"
 
     def __post_init__(self):
+        if self.readout not in READOUTS:
+            raise ValueError(f"planning readout {self.readout!r}; expected one of {READOUTS}")
+        if self.readout == "state_head" and getattr(self.model, "state_head", None) is None:
+            raise ValueError("readout=state_head needs a model trained with a state head "
+                             "(LeWM with model.loss_weights.state > 0)")
         self.stats = {key: torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
                       for key, value in self.normalization.items()}
         self.context_steps = self.model.context_steps
@@ -113,12 +144,12 @@ class Planner:
     @torch.no_grad()
     def predict_states(self, frames: Tensor, action_history: list[np.ndarray], future_actions: Tensor,
                        probe: StateProbe | None = None) -> Tensor:
-        """future_actions [N, H, 120] raw targets -> probe states [N, H, 40] in raw units.
+        """future_actions [N, H, 120] raw targets -> states [N, H, 40] in raw units (STATE_LAYOUT).
 
         ``action_history`` holds the raw actions taken so far (only the last
-        ``context_steps - 1`` are used); ``probe`` defaults to the planning probe.
+        ``context_steps - 1`` are used). An explicit ``probe`` always reads the
+        latents; without one, the planner's ``readout`` does.
         """
-        probe = probe or self.probe
         count, horizon = future_actions.shape[:2]
         past = self._past_actions(action_history, future_actions.shape[-1])[None].expand(count, -1, -1)
         actions = torch.cat((past, future_actions.float()), dim=1)
@@ -126,7 +157,20 @@ class Planner:
         with autocast(self.device, self.precision):
             latents = rollout_latents(self.model, frames.expand(count, *frames.shape[1:]), actions,
                                       self.context_steps, horizon)
+        if probe is None and self.readout == "state_head":
+            return self._state_head_states(latents.float())
+        probe = probe or self.probe
         return probe.standardized(latents.float()) * probe.target_std + probe.target_mean
+
+    def _state_head_states(self, latents: Tensor) -> Tensor:
+        """Latents -> the state head's proprio, un-normalized, laid out as STATE_LAYOUT. The head has
+        no base position or contacts; those entries are NaN so a cost that reads them fails loudly."""
+        proprio = self.model.state_head(latents) * self.stats["proprio_std"] + self.stats["proprio_mean"]
+        states = torch.full((*proprio.shape[:-1], STATE_LAYOUT["contacts"].stop), float("nan"),
+                            device=proprio.device)
+        for key, source in PROPRIO_LAYOUT.items():
+            states[..., STATE_LAYOUT[key]] = proprio[..., source]
+        return states
 
     def plan(self, observations: list[dict], action_history: list[np.ndarray], nominal: np.ndarray,
              command_mps: float, warm_start: Tensor | None) -> Tensor:
@@ -146,7 +190,9 @@ class Planner:
                    elites=int(cfg["elites"]), iterations=int(cfg["iterations"]),
                    init_std=float(cfg["init_std"]), min_std=float(cfg["min_std"]),
                    clip=float(cfg["max_residual_rad"]), mean=warm_start, generator=self.generator,
-                   device=self.device)
+                   device=self.device, std_momentum=float(cfg.get("std_momentum", 0.0)),
+                   keep_mean=bool(cfg.get("keep_mean", False)), keep_zero=bool(cfg.get("keep_zero", False)),
+                   return_best=bool(cfg.get("return_best", False)))
 
 
 @dataclass(frozen=True)
